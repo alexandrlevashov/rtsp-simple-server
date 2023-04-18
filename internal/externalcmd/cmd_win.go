@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package externalcmd
@@ -5,52 +6,55 @@ package externalcmd
 import (
 	"os"
 	"os/exec"
-	"strings"
 
 	"github.com/kballard/go-shellquote"
 )
 
-func (e *Cmd) runInner() bool {
-	// on Windows the shell is not used and command is started directly
-	// variables are replaced manually in order to guarantee compatibility
-	// with Linux commands
-	tmp := strings.ReplaceAll(e.cmdstr, "$RTSP_PATH", e.env.Path)
-	tmp = strings.ReplaceAll(tmp, "$RTSP_PORT", e.env.Port)
-	parts, err := shellquote.Split(tmp)
+func (e *Cmd) runInner() (int, bool) {
+	cmdparts, err := shellquote.Split(e.cmdstr)
 	if err != nil {
-		return true
+		return 0, true
 	}
 
-	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd := exec.Command(cmdparts[0], cmdparts[1:]...)
 
-	cmd.Env = append(os.Environ(),
-		"RTSP_PATH="+e.env.Path,
-		"RTSP_PORT="+e.env.Port,
-	)
+	cmd.Env = append([]string(nil), os.Environ()...)
+	for key, val := range e.env {
+		cmd.Env = append(cmd.Env, key+"="+val)
+	}
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	err = cmd.Start()
 	if err != nil {
-		return true
+		return 0, true
 	}
 
-	cmdDone := make(chan struct{})
+	cmdDone := make(chan int)
 	go func() {
-		defer close(cmdDone)
-		cmd.Wait()
+		cmdDone <- func() int {
+			err := cmd.Wait()
+			if err == nil {
+				return 0
+			}
+			ee, ok := err.(*exec.ExitError)
+			if !ok {
+				return 0
+			}
+			return ee.ExitCode()
+		}()
 	}()
 
 	select {
 	case <-e.terminate:
-		// on Windows it's not possible to send os.Interrupt to a process
-		// Kill() is the only supported way
+		// on Windows, it's not possible to send os.Interrupt to a process.
+		// Kill() is the only supported way.
 		cmd.Process.Kill()
 		<-cmdDone
-		return false
+		return 0, false
 
-	case <-cmdDone:
-		return true
+	case c := <-cmdDone:
+		return c, true
 	}
 }

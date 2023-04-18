@@ -2,13 +2,16 @@ package core
 
 import (
 	"context"
+	"log"
 	"net"
 	"net/http"
+	"time"
 
 	// start pprof
 	_ "net/http/pprof"
 
-	"github.com/aler9/rtsp-simple-server/internal/logger"
+	"github.com/aler9/mediamtx/internal/conf"
+	"github.com/aler9/mediamtx/internal/logger"
 )
 
 type pprofParent interface {
@@ -16,41 +19,46 @@ type pprofParent interface {
 }
 
 type pprof struct {
-	ln     net.Listener
-	server *http.Server
+	parent pprofParent
+
+	ln         net.Listener
+	httpServer *http.Server
 }
 
 func newPPROF(
 	address string,
+	readTimeout conf.StringDuration,
 	parent pprofParent,
 ) (*pprof, error) {
-	ln, err := net.Listen("tcp", address)
+	ln, err := net.Listen(restrictNetwork("tcp", address))
 	if err != nil {
 		return nil, err
 	}
 
 	pp := &pprof{
-		ln: ln,
+		parent: parent,
+		ln:     ln,
 	}
 
-	pp.server = &http.Server{
-		Handler: http.DefaultServeMux,
+	pp.httpServer = &http.Server{
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: time.Duration(readTimeout),
+		ErrorLog:          log.New(&nilWriter{}, "", 0),
 	}
 
-	parent.Log(logger.Info, "[pprof] opened on "+address)
+	pp.log(logger.Info, "listener opened on "+address)
 
-	go pp.run()
+	go pp.httpServer.Serve(pp.ln)
 
 	return pp, nil
 }
 
 func (pp *pprof) close() {
-	pp.server.Shutdown(context.Background())
+	pp.log(logger.Info, "listener is closing")
+	pp.httpServer.Shutdown(context.Background())
+	pp.ln.Close() // in case Shutdown() is called before Serve()
 }
 
-func (pp *pprof) run() {
-	err := pp.server.Serve(pp.ln)
-	if err != http.ErrServerClosed {
-		panic(err)
-	}
+func (pp *pprof) log(level logger.Level, format string, args ...interface{}) {
+	pp.parent.Log(level, "[pprof] "+format, args...)
 }

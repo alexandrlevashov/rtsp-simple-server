@@ -6,13 +6,13 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/aler9/rtsp-simple-server/internal/logger"
+	"github.com/aler9/mediamtx/internal/logger"
 )
 
 // LogDestinations is the logDestionations parameter.
 type LogDestinations map[logger.Destination]struct{}
 
-// MarshalJSON marshals a LogDestinations into JSON.
+// MarshalJSON implements json.Marshaler.
 func (d LogDestinations) MarshalJSON() ([]byte, error) {
 	out := make([]string, len(d))
 	i := 0
@@ -27,8 +27,11 @@ func (d LogDestinations) MarshalJSON() ([]byte, error) {
 		case logger.DestinationFile:
 			v = "file"
 
-		default:
+		case logger.DestinationSyslog:
 			v = "syslog"
+
+		default:
+			return nil, fmt.Errorf("invalid log destination: %v", p)
 		}
 
 		out[i] = v
@@ -40,7 +43,7 @@ func (d LogDestinations) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
-// UnmarshalJSON unmarshals a LogDestinations from JSON.
+// UnmarshalJSON implements json.Unmarshaler.
 func (d *LogDestinations) UnmarshalJSON(b []byte) error {
 	var in []string
 	if err := json.Unmarshal(b, &in); err != nil {
@@ -68,6 +71,7 @@ func (d *LogDestinations) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// unmarshalEnv implements envUnmarshaler.
 func (d *LogDestinations) unmarshalEnv(s string) error {
 	byts, _ := json.Marshal(strings.Split(s, ","))
 	return d.UnmarshalJSON(byts)

@@ -52,6 +52,16 @@ func loadEnvInternal(env map[string]string, prefix string, rv reflect.Value) err
 		}
 		return nil
 
+	case reflect.TypeOf(float64(0)):
+		if ev, ok := env[prefix]; ok {
+			iv, err := strconv.ParseFloat(ev, 64)
+			if err != nil {
+				return fmt.Errorf("%s: %s", prefix, err)
+			}
+			rv.SetFloat(iv)
+		}
+		return nil
+
 	case reflect.TypeOf(bool(false)):
 		if ev, ok := env[prefix]; ok {
 			switch strings.ToLower(ev) {
@@ -121,6 +131,18 @@ func loadEnvInternal(env map[string]string, prefix string, rv reflect.Value) err
 			}
 		}
 		return nil
+
+	case reflect.Slice:
+		if rt.Elem() == reflect.TypeOf("") {
+			if ev, ok := env[prefix]; ok {
+				if ev == "" {
+					rv.Set(reflect.ValueOf([]string{}))
+				} else {
+					rv.Set(reflect.ValueOf(strings.Split(ev, ",")))
+				}
+			}
+			return nil
+		}
 	}
 
 	return fmt.Errorf("unsupported type: %v", rt)

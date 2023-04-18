@@ -7,213 +7,248 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/aler9/gortsplib"
-	"github.com/aler9/gortsplib/pkg/base"
+	"github.com/bluenviron/gortsplib/v3"
+	"github.com/bluenviron/gortsplib/v3/pkg/base"
+	"github.com/bluenviron/gortsplib/v3/pkg/formats"
+	"github.com/pion/rtp"
 
-	"github.com/aler9/rtsp-simple-server/internal/conf"
-	"github.com/aler9/rtsp-simple-server/internal/logger"
-)
-
-const (
-	rtspSourceRetryPause = 5 * time.Second
+	"github.com/aler9/mediamtx/internal/conf"
+	"github.com/aler9/mediamtx/internal/formatprocessor"
+	"github.com/aler9/mediamtx/internal/logger"
+	"github.com/bluenviron/gortsplib/v3/pkg/url"
 )
 
 type rtspSourceParent interface {
 	log(logger.Level, string, ...interface{})
-	onSourceStaticSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
-	OnSourceStaticSetNotReady(req pathSourceStaticSetNotReadyReq)
+	sourceStaticImplSetReady(req pathSourceStaticSetReadyReq) pathSourceStaticSetReadyRes
+	sourceStaticImplSetNotReady(req pathSourceStaticSetNotReadyReq)
 }
 
 type rtspSource struct {
-	ur              string
-	proto           conf.SourceProtocol
-	anyPortEnable   bool
-	fingerprint     string
 	readTimeout     conf.StringDuration
 	writeTimeout    conf.StringDuration
 	readBufferCount int
-	readBufferSize  int
-	wg              *sync.WaitGroup
 	parent          rtspSourceParent
-
-	ctx       context.Context
-	ctxCancel func()
 }
 
 func newRTSPSource(
-	parentCtx context.Context,
-	ur string,
-	proto conf.SourceProtocol,
-	anyPortEnable bool,
-	fingerprint string,
 	readTimeout conf.StringDuration,
 	writeTimeout conf.StringDuration,
 	readBufferCount int,
-	readBufferSize int,
-	wg *sync.WaitGroup,
-	parent rtspSourceParent) *rtspSource {
-	ctx, ctxCancel := context.WithCancel(parentCtx)
-
-	s := &rtspSource{
-		ur:              ur,
-		proto:           proto,
-		anyPortEnable:   anyPortEnable,
-		fingerprint:     fingerprint,
+	parent rtspSourceParent,
+) *rtspSource {
+	return &rtspSource{
 		readTimeout:     readTimeout,
 		writeTimeout:    writeTimeout,
 		readBufferCount: readBufferCount,
-		readBufferSize:  readBufferSize,
-		wg:              wg,
 		parent:          parent,
-		ctx:             ctx,
-		ctxCancel:       ctxCancel,
 	}
-
-	s.log(logger.Info, "started")
-
-	s.wg.Add(1)
-	go s.run()
-
-	return s
 }
 
-func (s *rtspSource) close() {
-	s.log(logger.Info, "stopped")
-	s.ctxCancel()
-}
-
-func (s *rtspSource) log(level logger.Level, format string, args ...interface{}) {
+func (s *rtspSource) Log(level logger.Level, format string, args ...interface{}) {
 	s.parent.log(level, "[rtsp source] "+format, args...)
 }
 
-func (s *rtspSource) run() {
-	defer s.wg.Done()
+// run implements sourceStaticImpl.
+func (s *rtspSource) run(ctx context.Context, cnf *conf.PathConf, reloadConf chan *conf.PathConf) error {
+	s.Log(logger.Debug, "connecting")
 
-	for {
-		ok := func() bool {
-			ok := s.runInner()
-			if !ok {
-				return false
-			}
+	var tlsConfig *tls.Config
+	if cnf.SourceFingerprint != "" {
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: true,
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				h := sha256.New()
+				h.Write(cs.PeerCertificates[0].Raw)
+				hstr := hex.EncodeToString(h.Sum(nil))
+				fingerprintLower := strings.ToLower(cnf.SourceFingerprint)
 
-			select {
-			case <-time.After(rtspSourceRetryPause):
-				return true
-			case <-s.ctx.Done():
-				return false
-			}
-		}()
-		if !ok {
-			break
+				if hstr != fingerprintLower {
+					return fmt.Errorf("server fingerprint do not match: expected %s, got %s",
+						fingerprintLower, hstr)
+				}
+
+				return nil
+			},
 		}
 	}
 
-	s.ctxCancel()
-}
-
-func (s *rtspSource) runInner() bool {
-	s.log(logger.Debug, "connecting")
-
-	tlsConfig := &tls.Config{}
-
-	if s.fingerprint != "" {
-		tlsConfig.InsecureSkipVerify = true
-		tlsConfig.VerifyConnection = func(cs tls.ConnectionState) error {
-			h := sha256.New()
-			h.Write(cs.PeerCertificates[0].Raw)
-			hstr := hex.EncodeToString(h.Sum(nil))
-			fingerprintLower := strings.ToLower(s.fingerprint)
-
-			if hstr != fingerprintLower {
-				return fmt.Errorf("server fingerprint do not match: expected %s, got %s",
-					fingerprintLower, hstr)
-			}
-
-			return nil
-		}
-	}
-
-	client := &gortsplib.Client{
-		Transport:       s.proto.Transport,
+	c := &gortsplib.Client{
+		Transport:       cnf.SourceProtocol.Transport,
 		TLSConfig:       tlsConfig,
 		ReadTimeout:     time.Duration(s.readTimeout),
 		WriteTimeout:    time.Duration(s.writeTimeout),
 		ReadBufferCount: s.readBufferCount,
-		ReadBufferSize:  s.readBufferSize,
-		AnyPortEnable:   s.anyPortEnable,
+		AnyPortEnable:   cnf.SourceAnyPortEnable,
 		OnRequest: func(req *base.Request) {
-			s.log(logger.Debug, "c->s %v", req)
+			s.Log(logger.Debug, "c->s %v", req)
 		},
 		OnResponse: func(res *base.Response) {
-			s.log(logger.Debug, "s->c %v", res)
+			s.Log(logger.Debug, "s->c %v", res)
+		},
+		OnTransportSwitch: func(err error) {
+			s.Log(logger.Warn, err.Error())
+		},
+		OnPacketLost: func(err error) {
+			s.Log(logger.Warn, err.Error())
+		},
+		OnDecodeError: func(err error) {
+			s.Log(logger.Warn, err.Error())
 		},
 	}
 
-	innerCtx, innerCtxCancel := context.WithCancel(context.Background())
-
-	var conn *gortsplib.ClientConn
-	var err error
-	dialDone := make(chan struct{})
-	go func() {
-		defer close(dialDone)
-		conn, err = client.DialReadContext(innerCtx, s.ur)
-	}()
-
-	select {
-	case <-s.ctx.Done():
-		innerCtxCancel()
-		<-dialDone
-		return false
-
-	case <-dialDone:
-		innerCtxCancel()
-	}
-
+	u, err := url.Parse(cnf.Source)
 	if err != nil {
-		s.log(logger.Info, "ERR: %s", err)
-		return true
+		return err
 	}
 
-	res := s.parent.onSourceStaticSetReady(pathSourceStaticSetReadyReq{
-		Source: s,
-		Tracks: conn.Tracks(),
-	})
-	if res.Err != nil {
-		s.log(logger.Info, "ERR: %s", res.Err)
-		return true
+	err = c.Start(u.Scheme, u.Host)
+	if err != nil {
+		return err
 	}
-
-	s.log(logger.Info, "ready")
-
-	defer func() {
-		s.parent.OnSourceStaticSetNotReady(pathSourceStaticSetNotReadyReq{Source: s})
-	}()
+	defer c.Close()
 
 	readErr := make(chan error)
 	go func() {
-		readErr <- conn.ReadFrames(func(trackID int, streamType gortsplib.StreamType, payload []byte) {
-			res.Stream.onFrame(trackID, streamType, payload)
-		})
+		readErr <- func() error {
+			medias, baseURL, _, err := c.Describe(u)
+			if err != nil {
+				return err
+			}
+
+			err = c.SetupAll(medias, baseURL)
+			if err != nil {
+				return err
+			}
+
+			res := s.parent.sourceStaticImplSetReady(pathSourceStaticSetReadyReq{
+				medias:             medias,
+				generateRTPPackets: false,
+			})
+			if res.err != nil {
+				return res.err
+			}
+
+			s.Log(logger.Info, "ready: %s", sourceMediaInfo(medias))
+
+			defer func() {
+				s.parent.sourceStaticImplSetNotReady(pathSourceStaticSetNotReadyReq{})
+			}()
+
+			for _, medi := range medias {
+				for _, forma := range medi.Formats {
+					cmedia := medi
+					cformat := forma
+
+					switch forma.(type) {
+					case *formats.H264:
+						c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+							err := res.stream.writeData(cmedia, cformat, &formatprocessor.UnitH264{
+								RTPPackets: []*rtp.Packet{pkt},
+								NTP:        time.Now(),
+							})
+							if err != nil {
+								s.Log(logger.Warn, "%v", err)
+							}
+						})
+
+					case *formats.H265:
+						c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+							err := res.stream.writeData(cmedia, cformat, &formatprocessor.UnitH265{
+								RTPPackets: []*rtp.Packet{pkt},
+								NTP:        time.Now(),
+							})
+							if err != nil {
+								s.Log(logger.Warn, "%v", err)
+							}
+						})
+
+					case *formats.VP8:
+						c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+							err := res.stream.writeData(cmedia, cformat, &formatprocessor.UnitVP8{
+								RTPPackets: []*rtp.Packet{pkt},
+								NTP:        time.Now(),
+							})
+							if err != nil {
+								s.Log(logger.Warn, "%v", err)
+							}
+						})
+
+					case *formats.VP9:
+						c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+							err := res.stream.writeData(cmedia, cformat, &formatprocessor.UnitVP9{
+								RTPPackets: []*rtp.Packet{pkt},
+								NTP:        time.Now(),
+							})
+							if err != nil {
+								s.Log(logger.Warn, "%v", err)
+							}
+						})
+
+					case *formats.MPEG4Audio:
+						c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+							err := res.stream.writeData(cmedia, cformat, &formatprocessor.UnitMPEG4Audio{
+								RTPPackets: []*rtp.Packet{pkt},
+								NTP:        time.Now(),
+							})
+							if err != nil {
+								s.Log(logger.Warn, "%v", err)
+							}
+						})
+
+					case *formats.Opus:
+						c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+							err := res.stream.writeData(cmedia, cformat, &formatprocessor.UnitOpus{
+								RTPPackets: []*rtp.Packet{pkt},
+								NTP:        time.Now(),
+							})
+							if err != nil {
+								s.Log(logger.Warn, "%v", err)
+							}
+						})
+
+					default:
+						c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+							err := res.stream.writeData(cmedia, cformat, &formatprocessor.UnitGeneric{
+								RTPPackets: []*rtp.Packet{pkt},
+								NTP:        time.Now(),
+							})
+							if err != nil {
+								s.Log(logger.Warn, "%v", err)
+							}
+						})
+					}
+				}
+			}
+
+			_, err = c.Play(nil)
+			if err != nil {
+				return err
+			}
+
+			return c.Wait()
+		}()
 	}()
 
-	select {
-	case <-s.ctx.Done():
-		conn.Close()
-		<-readErr
-		return false
+	for {
+		select {
+		case err := <-readErr:
+			return err
 
-	case err := <-readErr:
-		s.log(logger.Info, "ERR: %s", err)
-		conn.Close()
-		return true
+		case <-reloadConf:
+
+		case <-ctx.Done():
+			c.Close()
+			<-readErr
+			return nil
+		}
 	}
 }
 
-// onSourceAPIDescribe implements source.
-func (*rtspSource) onSourceAPIDescribe() interface{} {
+// apiSourceDescribe implements sourceStaticImpl.
+func (*rtspSource) apiSourceDescribe() interface{} {
 	return struct {
 		Type string `json:"type"`
 	}{"rtspSource"}

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/aler9/gortsplib"
+	"github.com/bluenviron/gortsplib/v3"
 )
 
 // SourceProtocol is the sourceProtocol parameter.
@@ -12,7 +12,7 @@ type SourceProtocol struct {
 	*gortsplib.Transport
 }
 
-// MarshalJSON marshals a SourceProtocol into JSON.
+// MarshalJSON implements json.Marshaler.
 func (d SourceProtocol) MarshalJSON() ([]byte, error) {
 	var out string
 
@@ -26,15 +26,18 @@ func (d SourceProtocol) MarshalJSON() ([]byte, error) {
 		case gortsplib.TransportUDPMulticast:
 			out = "multicast"
 
-		default:
+		case gortsplib.TransportTCP:
 			out = "tcp"
+
+		default:
+			return nil, fmt.Errorf("invalid protocol: %v", d.Transport)
 		}
 	}
 
 	return json.Marshal(out)
 }
 
-// UnmarshalJSON unmarshals a SourceProtocol from JSON.
+// UnmarshalJSON implements json.Unmarshaler.
 func (d *SourceProtocol) UnmarshalJSON(b []byte) error {
 	var in string
 	if err := json.Unmarshal(b, &in); err != nil {
@@ -55,6 +58,7 @@ func (d *SourceProtocol) UnmarshalJSON(b []byte) error {
 		d.Transport = &v
 
 	case "automatic":
+		d.Transport = nil
 
 	default:
 		return fmt.Errorf("invalid protocol '%s'", in)
@@ -63,6 +67,7 @@ func (d *SourceProtocol) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// unmarshalEnv implements envUnmarshaler.
 func (d *SourceProtocol) unmarshalEnv(s string) error {
 	return d.UnmarshalJSON([]byte(`"` + s + `"`))
 }

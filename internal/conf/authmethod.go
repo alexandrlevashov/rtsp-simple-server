@@ -6,13 +6,13 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/aler9/gortsplib/pkg/headers"
+	"github.com/bluenviron/gortsplib/v3/pkg/headers"
 )
 
 // AuthMethods is the authMethods parameter.
 type AuthMethods []headers.AuthMethod
 
-// MarshalJSON marshals a AuthMethods into JSON.
+// MarshalJSON implements json.Marshaler.
 func (d AuthMethods) MarshalJSON() ([]byte, error) {
 	out := make([]string, len(d))
 
@@ -21,8 +21,11 @@ func (d AuthMethods) MarshalJSON() ([]byte, error) {
 		case headers.AuthBasic:
 			out[i] = "basic"
 
-		default:
+		case headers.AuthDigest:
 			out[i] = "digest"
+
+		default:
+			return nil, fmt.Errorf("invalid authentication method: %v", v)
 		}
 	}
 
@@ -31,7 +34,7 @@ func (d AuthMethods) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
-// UnmarshalJSON unmarshals a AuthMethods from JSON.
+// UnmarshalJSON implements json.Unmarshaler.
 func (d *AuthMethods) UnmarshalJSON(b []byte) error {
 	var in []string
 	if err := json.Unmarshal(b, &in); err != nil {
@@ -47,13 +50,14 @@ func (d *AuthMethods) UnmarshalJSON(b []byte) error {
 			*d = append(*d, headers.AuthDigest)
 
 		default:
-			return fmt.Errorf("invalid authentication method: %s", v)
+			return fmt.Errorf("invalid authentication method: '%s'", v)
 		}
 	}
 
 	return nil
 }
 
+// unmarshalEnv implements envUnmarshaler.
 func (d *AuthMethods) unmarshalEnv(s string) error {
 	byts, _ := json.Marshal(strings.Split(s, ","))
 	return d.UnmarshalJSON(byts)

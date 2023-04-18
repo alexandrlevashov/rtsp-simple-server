@@ -2,23 +2,32 @@ package core
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
-	"io"
+	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	gopath "path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/aler9/rtsp-simple-server/internal/conf"
-	"github.com/aler9/rtsp-simple-server/internal/logger"
+	"github.com/aler9/mediamtx/internal/conf"
+	"github.com/aler9/mediamtx/internal/logger"
 )
 
+type nilWriter struct{}
+
+func (nilWriter) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
 type hlsServerAPIMuxersListItem struct {
-	LastRequest string `json:"lastRequest"`
+	Created     time.Time `json:"created"`
+	LastRequest time.Time `json:"lastRequest"`
+	BytesSent   uint64    `json:"bytesSent"`
 }
 
 type hlsServerAPIMuxersListData struct {
@@ -26,18 +35,18 @@ type hlsServerAPIMuxersListData struct {
 }
 
 type hlsServerAPIMuxersListRes struct {
-	Data   *hlsServerAPIMuxersListData
-	Muxers map[string]*hlsMuxer
-	Err    error
+	data   *hlsServerAPIMuxersListData
+	muxers map[string]*hlsMuxer
+	err    error
 }
 
 type hlsServerAPIMuxersListReq struct {
-	Res chan hlsServerAPIMuxersListRes
+	res chan hlsServerAPIMuxersListRes
 }
 
 type hlsServerAPIMuxersListSubReq struct {
-	Data *hlsServerAPIMuxersListData
-	Res  chan struct{}
+	data *hlsServerAPIMuxersListData
+	res  chan struct{}
 }
 
 type hlsServerParent interface {
@@ -45,72 +54,120 @@ type hlsServerParent interface {
 }
 
 type hlsServer struct {
-	hlsAlwaysRemux     bool
-	hlsSegmentCount    int
-	hlsSegmentDuration conf.StringDuration
-	hlsAllowOrigin     string
-	readBufferCount    int
-	pathManager        *pathManager
-	metrics            *metrics
-	parent             hlsServerParent
+	externalAuthenticationURL string
+	alwaysRemux               bool
+	variant                   conf.HLSVariant
+	segmentCount              int
+	segmentDuration           conf.StringDuration
+	partDuration              conf.StringDuration
+	segmentMaxSize            conf.StringSize
+	allowOrigin               string
+	directory                 string
+	readBufferCount           int
+	pathManager               *pathManager
+	metrics                   *metrics
+	parent                    hlsServerParent
 
-	ctx       context.Context
-	ctxCancel func()
-	wg        sync.WaitGroup
-	ln        net.Listener
-	muxers    map[string]*hlsMuxer
+	ctx        context.Context
+	ctxCancel  func()
+	wg         sync.WaitGroup
+	ln         net.Listener
+	httpServer *http.Server
+	muxers     map[string]*hlsMuxer
 
 	// in
-	pathSourceReady chan *path
-	request         chan hlsMuxerRequest
-	muxerClose      chan *hlsMuxer
-	apiMuxersList   chan hlsServerAPIMuxersListReq
+	chPathSourceReady    chan *path
+	chPathSourceNotReady chan *path
+	request              chan *hlsMuxerRequest
+	chMuxerClose         chan *hlsMuxer
+	chAPIMuxerList       chan hlsServerAPIMuxersListReq
 }
 
 func newHLSServer(
 	parentCtx context.Context,
 	address string,
-	hlsAlwaysRemux bool,
-	hlsSegmentCount int,
-	hlsSegmentDuration conf.StringDuration,
-	hlsAllowOrigin string,
+	encryption bool,
+	serverKey string,
+	serverCert string,
+	externalAuthenticationURL string,
+	alwaysRemux bool,
+	variant conf.HLSVariant,
+	segmentCount int,
+	segmentDuration conf.StringDuration,
+	partDuration conf.StringDuration,
+	segmentMaxSize conf.StringSize,
+	allowOrigin string,
+	trustedProxies conf.IPsOrCIDRs,
+	directory string,
+	readTimeout conf.StringDuration,
 	readBufferCount int,
 	pathManager *pathManager,
 	metrics *metrics,
 	parent hlsServerParent,
 ) (*hlsServer, error) {
-	ln, err := net.Listen("tcp", address)
+	ln, err := net.Listen(restrictNetwork("tcp", address))
 	if err != nil {
 		return nil, err
+	}
+
+	var tlsConfig *tls.Config
+	if encryption {
+		crt, err := tls.LoadX509KeyPair(serverCert, serverKey)
+		if err != nil {
+			ln.Close()
+			return nil, err
+		}
+
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{crt},
+		}
 	}
 
 	ctx, ctxCancel := context.WithCancel(parentCtx)
 
 	s := &hlsServer{
-		hlsAlwaysRemux:     hlsAlwaysRemux,
-		hlsSegmentCount:    hlsSegmentCount,
-		hlsSegmentDuration: hlsSegmentDuration,
-		hlsAllowOrigin:     hlsAllowOrigin,
-		readBufferCount:    readBufferCount,
-		pathManager:        pathManager,
-		parent:             parent,
-		metrics:            metrics,
-		ctx:                ctx,
-		ctxCancel:          ctxCancel,
-		ln:                 ln,
-		muxers:             make(map[string]*hlsMuxer),
-		pathSourceReady:    make(chan *path),
-		request:            make(chan hlsMuxerRequest),
-		muxerClose:         make(chan *hlsMuxer),
-		apiMuxersList:      make(chan hlsServerAPIMuxersListReq),
+		externalAuthenticationURL: externalAuthenticationURL,
+		alwaysRemux:               alwaysRemux,
+		variant:                   variant,
+		segmentCount:              segmentCount,
+		segmentDuration:           segmentDuration,
+		partDuration:              partDuration,
+		segmentMaxSize:            segmentMaxSize,
+		allowOrigin:               allowOrigin,
+		directory:                 directory,
+		readBufferCount:           readBufferCount,
+		pathManager:               pathManager,
+		parent:                    parent,
+		metrics:                   metrics,
+		ctx:                       ctx,
+		ctxCancel:                 ctxCancel,
+		ln:                        ln,
+		muxers:                    make(map[string]*hlsMuxer),
+		chPathSourceReady:         make(chan *path),
+		chPathSourceNotReady:      make(chan *path),
+		request:                   make(chan *hlsMuxerRequest),
+		chMuxerClose:              make(chan *hlsMuxer),
+		chAPIMuxerList:            make(chan hlsServerAPIMuxersListReq),
+	}
+
+	router := gin.New()
+	httpSetTrustedProxies(router, trustedProxies)
+
+	router.NoRoute(httpLoggerMiddleware(s), httpServerHeaderMiddleware, s.onRequest)
+
+	s.httpServer = &http.Server{
+		Handler:           router,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: time.Duration(readTimeout),
+		ErrorLog:          log.New(&nilWriter{}, "", 0),
 	}
 
 	s.log(logger.Info, "listener opened on "+address)
 
-	s.pathManager.onHLSServerSet(s)
+	s.pathManager.hlsServerSet(s)
 
 	if s.metrics != nil {
-		s.metrics.onHLSServerSet(s)
+		s.metrics.hlsServerSet(s)
 	}
 
 	s.wg.Add(1)
@@ -125,47 +182,66 @@ func (s *hlsServer) log(level logger.Level, format string, args ...interface{}) 
 }
 
 func (s *hlsServer) close() {
+	s.log(logger.Info, "listener is closing")
 	s.ctxCancel()
 	s.wg.Wait()
-	s.log(logger.Info, "closed")
 }
 
 func (s *hlsServer) run() {
 	defer s.wg.Done()
 
-	router := gin.New()
-	router.NoRoute(s.onRequest)
-
-	hs := &http.Server{Handler: router}
-	go hs.Serve(s.ln)
+	if s.httpServer.TLSConfig != nil {
+		go s.httpServer.ServeTLS(s.ln, "", "")
+	} else {
+		go s.httpServer.Serve(s.ln)
+	}
 
 outer:
 	for {
 		select {
-		case pa := <-s.pathSourceReady:
-			if s.hlsAlwaysRemux {
-				s.findOrCreateMuxer(pa.Name())
+		case pa := <-s.chPathSourceReady:
+			if s.alwaysRemux {
+				s.createMuxer(pa.name, "")
+			}
+
+		case pa := <-s.chPathSourceNotReady:
+			if s.alwaysRemux {
+				c, ok := s.muxers[pa.name]
+				if ok {
+					c.close()
+					delete(s.muxers, pa.name)
+				}
 			}
 
 		case req := <-s.request:
-			r := s.findOrCreateMuxer(req.Dir)
-			r.onRequest(req)
+			r, ok := s.muxers[req.path]
+			switch {
+			case ok:
+				r.processRequest(req)
 
-		case c := <-s.muxerClose:
+			case s.alwaysRemux:
+				req.res <- nil
+
+			default:
+				r := s.createMuxer(req.path, req.clientIP)
+				r.processRequest(req)
+			}
+
+		case c := <-s.chMuxerClose:
 			if c2, ok := s.muxers[c.PathName()]; !ok || c2 != c {
 				continue
 			}
 			delete(s.muxers, c.PathName())
 
-		case req := <-s.apiMuxersList:
+		case req := <-s.chAPIMuxerList:
 			muxers := make(map[string]*hlsMuxer)
 
 			for name, m := range s.muxers {
 				muxers[name] = m
 			}
 
-			req.Res <- hlsServerAPIMuxersListRes{
-				Muxers: muxers,
+			req.res <- hlsServerAPIMuxersListRes{
+				muxers: muxers,
 			}
 
 		case <-s.ctx.Done():
@@ -175,26 +251,18 @@ outer:
 
 	s.ctxCancel()
 
-	hs.Shutdown(context.Background())
+	s.httpServer.Shutdown(context.Background())
+	s.ln.Close() // in case Shutdown() is called before Serve()
 
-	s.pathManager.onHLSServerSet(nil)
+	s.pathManager.hlsServerSet(nil)
 
 	if s.metrics != nil {
-		s.metrics.onHLSServerSet(nil)
+		s.metrics.hlsServerSet(nil)
 	}
 }
 
 func (s *hlsServer) onRequest(ctx *gin.Context) {
-	s.log(logger.Info, "[conn %v] %s %s", ctx.Request.RemoteAddr, ctx.Request.Method, ctx.Request.URL.Path)
-
-	byts, _ := httputil.DumpRequest(ctx.Request, true)
-	s.log(logger.Debug, "[conn %v] [c->s] %s", ctx.Request.RemoteAddr, string(byts))
-
-	logw := &httpLogWriter{ResponseWriter: ctx.Writer}
-	ctx.Writer = logw
-
-	ctx.Writer.Header().Set("Server", "rtsp-simple-server")
-	ctx.Writer.Header().Set("Access-Control-Allow-Origin", s.hlsAllowOrigin)
+	ctx.Writer.Header().Set("Access-Control-Allow-Origin", s.allowOrigin)
 	ctx.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 
 	switch ctx.Request.Method {
@@ -207,7 +275,6 @@ func (s *hlsServer) onRequest(ctx *gin.Context) {
 		return
 
 	default:
-		ctx.Writer.WriteHeader(http.StatusNotFound)
 		return
 	}
 
@@ -216,12 +283,14 @@ func (s *hlsServer) onRequest(ctx *gin.Context) {
 
 	switch pa {
 	case "", "favicon.ico":
-		ctx.Writer.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	dir, fname := func() (string, string) {
-		if strings.HasSuffix(pa, ".ts") || strings.HasSuffix(pa, ".m3u8") {
+		if strings.HasSuffix(pa, ".m3u8") ||
+			strings.HasSuffix(pa, ".ts") ||
+			strings.HasSuffix(pa, ".mp4") ||
+			strings.HasSuffix(pa, ".mp") {
 			return gopath.Dir(pa), gopath.Base(pa)
 		}
 		return pa, ""
@@ -233,88 +302,97 @@ func (s *hlsServer) onRequest(ctx *gin.Context) {
 		return
 	}
 
+	if strings.HasSuffix(fname, ".mp") {
+		fname += "4"
+	}
+
 	dir = strings.TrimSuffix(dir, "/")
 
-	cres := make(chan hlsMuxerResponse)
-	hreq := hlsMuxerRequest{
-		Dir:  dir,
-		File: fname,
-		Req:  ctx.Request,
-		Res:  cres,
+	hreq := &hlsMuxerRequest{
+		path:     dir,
+		file:     fname,
+		clientIP: ctx.ClientIP(),
+		res:      make(chan *hlsMuxer),
 	}
 
 	select {
 	case s.request <- hreq:
-		res := <-cres
-
-		for k, v := range res.Header {
-			ctx.Writer.Header().Set(k, v)
-		}
-		ctx.Writer.WriteHeader(res.Status)
-
-		if res.Body != nil {
-			io.Copy(ctx.Writer, res.Body)
+		muxer := <-hreq.res
+		if muxer != nil {
+			ctx.Request.URL.Path = fname
+			muxer.handleRequest(ctx)
 		}
 
 	case <-s.ctx.Done():
 	}
-
-	s.log(logger.Debug, "[conn %v] [s->c] %s", ctx.Request.RemoteAddr, logw.dump())
 }
 
-func (s *hlsServer) findOrCreateMuxer(pathName string) *hlsMuxer {
-	r, ok := s.muxers[pathName]
-	if !ok {
-		r = newHLSMuxer(
-			s.ctx,
-			pathName,
-			s.hlsAlwaysRemux,
-			s.hlsSegmentCount,
-			s.hlsSegmentDuration,
-			s.readBufferCount,
-			&s.wg,
-			pathName,
-			s.pathManager,
-			s)
-		s.muxers[pathName] = r
-	}
+func (s *hlsServer) createMuxer(pathName string, remoteAddr string) *hlsMuxer {
+	r := newHLSMuxer(
+		s.ctx,
+		remoteAddr,
+		s.externalAuthenticationURL,
+		s.alwaysRemux,
+		s.variant,
+		s.segmentCount,
+		s.segmentDuration,
+		s.partDuration,
+		s.segmentMaxSize,
+		s.directory,
+		s.readBufferCount,
+		&s.wg,
+		pathName,
+		s.pathManager,
+		s)
+	s.muxers[pathName] = r
 	return r
 }
 
-// onMuxerClose is called by hlsMuxer.
-func (s *hlsServer) onMuxerClose(c *hlsMuxer) {
+// muxerClose is called by hlsMuxer.
+func (s *hlsServer) muxerClose(c *hlsMuxer) {
 	select {
-	case s.muxerClose <- c:
+	case s.chMuxerClose <- c:
 	case <-s.ctx.Done():
 	}
 }
 
-// onPathSourceReady is called by core.
-func (s *hlsServer) onPathSourceReady(pa *path) {
+// pathSourceReady is called by pathManager.
+func (s *hlsServer) pathSourceReady(pa *path) {
 	select {
-	case s.pathSourceReady <- pa:
+	case s.chPathSourceReady <- pa:
 	case <-s.ctx.Done():
 	}
 }
 
-// onAPIHLSMuxersList is called by api.
-func (s *hlsServer) onAPIHLSMuxersList(req hlsServerAPIMuxersListReq) hlsServerAPIMuxersListRes {
-	req.Res = make(chan hlsServerAPIMuxersListRes)
+// pathSourceNotReady is called by pathManager.
+func (s *hlsServer) pathSourceNotReady(pa *path) {
 	select {
-	case s.apiMuxersList <- req:
-		res := <-req.Res
+	case s.chPathSourceNotReady <- pa:
+	case <-s.ctx.Done():
+	}
+}
 
-		res.Data = &hlsServerAPIMuxersListData{
+// apiMuxersList is called by api.
+func (s *hlsServer) apiMuxersList() hlsServerAPIMuxersListRes {
+	req := hlsServerAPIMuxersListReq{
+		res: make(chan hlsServerAPIMuxersListRes),
+	}
+
+	select {
+	case s.chAPIMuxerList <- req:
+		res := <-req.res
+
+		res.data = &hlsServerAPIMuxersListData{
 			Items: make(map[string]hlsServerAPIMuxersListItem),
 		}
 
-		for _, pa := range res.Muxers {
-			pa.onAPIHLSMuxersList(hlsServerAPIMuxersListSubReq{Data: res.Data})
+		for _, pa := range res.muxers {
+			pa.apiMuxersList(hlsServerAPIMuxersListSubReq{data: res.data})
 		}
 
 		return res
 
 	case <-s.ctx.Done():
-		return hlsServerAPIMuxersListRes{Err: fmt.Errorf("terminated")}
+		return hlsServerAPIMuxersListRes{err: fmt.Errorf("terminated")}
 	}
 }

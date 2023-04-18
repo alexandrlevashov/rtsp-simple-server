@@ -1,3 +1,4 @@
+// Package logger contains a logger implementation.
 package logger
 
 import (
@@ -67,7 +68,7 @@ func New(level Level, destinations map[Destination]struct{}, filePath string) (*
 
 	if _, ok := destinations[DestinationSyslog]; ok {
 		var err error
-		lh.syslog, err = newSyslog("rtsp-simple-server")
+		lh.syslog, err = newSyslog("mediamtx")
 		if err != nil {
 			lh.Close()
 			return nil, err
@@ -186,7 +187,7 @@ func (lh *Logger) Log(level Level, format string, args ...interface{}) {
 		writeTime(&lh.stdoutBuffer, true)
 		writeLevel(&lh.stdoutBuffer, level, true)
 		writeContent(&lh.stdoutBuffer, format, args)
-		print(lh.stdoutBuffer.String())
+		os.Stdout.Write(lh.stdoutBuffer.Bytes())
 	}
 
 	if _, ok := lh.destinations[DestinationFile]; ok {

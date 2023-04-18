@@ -1,6 +1,8 @@
+// Package externalcmd allows to launch external commands.
 package externalcmd
 
 import (
+	"strings"
 	"time"
 )
 
@@ -9,54 +11,64 @@ const (
 )
 
 // Environment is a Cmd environment.
-type Environment struct {
-	Path string
-	Port string
-}
+type Environment map[string]string
 
 // Cmd is an external command.
 type Cmd struct {
+	pool    *Pool
 	cmdstr  string
 	restart bool
 	env     Environment
+	onExit  func(int)
 
 	// in
 	terminate chan struct{}
-
-	// out
-	done chan struct{}
 }
 
-// New allocates an Cmd.
-func New(cmdstr string, restart bool, env Environment) *Cmd {
+// NewCmd allocates a Cmd.
+func NewCmd(
+	pool *Pool,
+	cmdstr string,
+	restart bool,
+	env Environment,
+	onExit func(int),
+) *Cmd {
+	for key, val := range env {
+		cmdstr = strings.ReplaceAll(cmdstr, "$"+key, val)
+	}
+
 	e := &Cmd{
+		pool:      pool,
 		cmdstr:    cmdstr,
 		restart:   restart,
 		env:       env,
+		onExit:    onExit,
 		terminate: make(chan struct{}),
-		done:      make(chan struct{}),
 	}
+
+	pool.wg.Add(1)
 
 	go e.run()
 
 	return e
 }
 
-// Close closes an Cmd.
+// Close closes the command. It doesn't wait for the command to exit.
 func (e *Cmd) Close() {
 	close(e.terminate)
-	<-e.done
 }
 
 func (e *Cmd) run() {
-	defer close(e.done)
+	defer e.pool.wg.Done()
 
 	for {
 		ok := func() bool {
-			ok := e.runInner()
+			c, ok := e.runInner()
 			if !ok {
 				return false
 			}
+
+			e.onExit(c)
 
 			if !e.restart {
 				<-e.terminate

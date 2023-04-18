@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/aler9/rtsp-simple-server/internal/logger"
+	"github.com/aler9/mediamtx/internal/logger"
 )
 
 // LogLevel is the logLevel parameter.
 type LogLevel logger.Level
 
-// MarshalJSON marshals a LogLevel into JSON.
+// MarshalJSON implements json.Marshaler.
 func (d LogLevel) MarshalJSON() ([]byte, error) {
 	var out string
 
@@ -24,14 +24,17 @@ func (d LogLevel) MarshalJSON() ([]byte, error) {
 	case LogLevel(logger.Info):
 		out = "info"
 
-	default:
+	case LogLevel(logger.Debug):
 		out = "debug"
+
+	default:
+		return nil, fmt.Errorf("invalid log level: %v", d)
 	}
 
 	return json.Marshal(out)
 }
 
-// UnmarshalJSON unmarshals a LogLevel from JSON.
+// UnmarshalJSON implements json.Unmarshaler.
 func (d *LogLevel) UnmarshalJSON(b []byte) error {
 	var in string
 	if err := json.Unmarshal(b, &in); err != nil {
@@ -52,12 +55,13 @@ func (d *LogLevel) UnmarshalJSON(b []byte) error {
 		*d = LogLevel(logger.Debug)
 
 	default:
-		return fmt.Errorf("invalid log level: %s", in)
+		return fmt.Errorf("invalid log level: '%s'", in)
 	}
 
 	return nil
 }
 
+// unmarshalEnv implements envUnmarshaler.
 func (d *LogLevel) unmarshalEnv(s string) error {
 	return d.UnmarshalJSON([]byte(`"` + s + `"`))
 }

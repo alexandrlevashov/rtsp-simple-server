@@ -1,20 +1,23 @@
+// Package conf contains the struct that holds the configuration of the software.
 package conf
 
 import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
+	"sort"
+	"strings"
 	"time"
 
-	"github.com/aler9/gortsplib"
-	"github.com/aler9/gortsplib/pkg/headers"
+	"github.com/bluenviron/gohlslib"
+	"github.com/bluenviron/gortsplib/v3"
+	"github.com/bluenviron/gortsplib/v3/pkg/headers"
 	"golang.org/x/crypto/nacl/secretbox"
 	"gopkg.in/yaml.v2"
 
-	"github.com/aler9/rtsp-simple-server/internal/logger"
+	"github.com/aler9/mediamtx/internal/logger"
 )
 
 func decrypt(key string, byts []byte) ([]byte, error) {
@@ -37,20 +40,35 @@ func decrypt(key string, byts []byte) ([]byte, error) {
 }
 
 func loadFromFile(fpath string, conf *Conf) (bool, error) {
-	// rtsp-simple-server.yml is optional
+	if fpath == "mediamtx.yml" {
+		// give priority to the legacy configuration file, in order not to break
+		// existing setups
+		if _, err := os.Stat("rtsp-simple-server.yml"); err == nil {
+			fpath = "rtsp-simple-server.yml"
+		}
+	}
+
+	// mediamtx.yml is optional
 	// other configuration files are not
-	if fpath == "rtsp-simple-server.yml" {
+	if fpath == "mediamtx.yml" || fpath == "rtsp-simple-server.yml" {
 		if _, err := os.Stat(fpath); err != nil {
 			return false, nil
 		}
 	}
 
-	byts, err := ioutil.ReadFile(fpath)
+	byts, err := os.ReadFile(fpath)
 	if err != nil {
 		return true, err
 	}
 
-	if key, ok := os.LookupEnv("RTSP_CONFKEY"); ok {
+	if key, ok := os.LookupEnv("RTSP_CONFKEY"); ok { // legacy format
+		byts, err = decrypt(key, byts)
+		if err != nil {
+			return true, err
+		}
+	}
+
+	if key, ok := os.LookupEnv("MTX_CONFKEY"); ok {
 		byts, err = decrypt(key, byts)
 		if err != nil {
 			return true, err
@@ -65,27 +83,41 @@ func loadFromFile(fpath string, conf *Conf) (bool, error) {
 	}
 
 	// convert interface{} keys into string keys to avoid JSON errors
-	var convert func(i interface{}) interface{}
-	convert = func(i interface{}) interface{} {
+	var convert func(i interface{}) (interface{}, error)
+	convert = func(i interface{}) (interface{}, error) {
 		switch x := i.(type) {
 		case map[interface{}]interface{}:
 			m2 := map[string]interface{}{}
 			for k, v := range x {
-				m2[k.(string)] = convert(v)
+				ks, ok := k.(string)
+				if !ok {
+					return nil, fmt.Errorf("integer keys are not supported (%v)", k)
+				}
+
+				m2[ks], err = convert(v)
+				if err != nil {
+					return nil, err
+				}
 			}
-			return m2
+			return m2, nil
 
 		case []interface{}:
 			a2 := make([]interface{}, len(x))
 			for i, v := range x {
-				a2[i] = convert(v)
+				a2[i], err = convert(v)
+				if err != nil {
+					return nil, err
+				}
 			}
-			return a2
+			return a2, nil
 		}
 
-		return i
+		return i, nil
 	}
-	temp = convert(temp)
+	temp, err = convert(temp)
+	if err != nil {
+		return false, err
+	}
 
 	// check for non-existent parameters
 	var checkNonExistentFields func(what interface{}, ref interface{}) error
@@ -153,20 +185,22 @@ func loadFromFile(fpath string, conf *Conf) (bool, error) {
 // Conf is a configuration.
 type Conf struct {
 	// general
-	LogLevel            LogLevel        `json:"logLevel"`
-	LogDestinations     LogDestinations `json:"logDestinations"`
-	LogFile             string          `json:"logFile"`
-	ReadTimeout         StringDuration  `json:"readTimeout"`
-	WriteTimeout        StringDuration  `json:"writeTimeout"`
-	ReadBufferCount     int             `json:"readBufferCount"`
-	API                 bool            `json:"api"`
-	APIAddress          string          `json:"apiAddress"`
-	Metrics             bool            `json:"metrics"`
-	MetricsAddress      string          `json:"metricsAddress"`
-	PPROF               bool            `json:"pprof"`
-	PPROFAddress        string          `json:"pprofAddress"`
-	RunOnConnect        string          `json:"runOnConnect"`
-	RunOnConnectRestart bool            `json:"runOnConnectRestart"`
+	LogLevel                  LogLevel        `json:"logLevel"`
+	LogDestinations           LogDestinations `json:"logDestinations"`
+	LogFile                   string          `json:"logFile"`
+	ReadTimeout               StringDuration  `json:"readTimeout"`
+	WriteTimeout              StringDuration  `json:"writeTimeout"`
+	ReadBufferCount           int             `json:"readBufferCount"`
+	UDPMaxPayloadSize         int             `json:"udpMaxPayloadSize"`
+	ExternalAuthenticationURL string          `json:"externalAuthenticationURL"`
+	API                       bool            `json:"api"`
+	APIAddress                string          `json:"apiAddress"`
+	Metrics                   bool            `json:"metrics"`
+	MetricsAddress            string          `json:"metricsAddress"`
+	PPROF                     bool            `json:"pprof"`
+	PPROFAddress              string          `json:"pprofAddress"`
+	RunOnConnect              string          `json:"runOnConnect"`
+	RunOnConnectRestart       bool            `json:"runOnConnectRestart"`
 
 	// RTSP
 	RTSPDisable       bool        `json:"rtspDisable"`
@@ -182,19 +216,43 @@ type Conf struct {
 	ServerKey         string      `json:"serverKey"`
 	ServerCert        string      `json:"serverCert"`
 	AuthMethods       AuthMethods `json:"authMethods"`
-	ReadBufferSize    int         `json:"readBufferSize"`
 
 	// RTMP
-	RTMPDisable bool   `json:"rtmpDisable"`
-	RTMPAddress string `json:"rtmpAddress"`
+	RTMPDisable    bool       `json:"rtmpDisable"`
+	RTMPAddress    string     `json:"rtmpAddress"`
+	RTMPEncryption Encryption `json:"rtmpEncryption"`
+	RTMPSAddress   string     `json:"rtmpsAddress"`
+	RTMPServerKey  string     `json:"rtmpServerKey"`
+	RTMPServerCert string     `json:"rtmpServerCert"`
 
 	// HLS
 	HLSDisable         bool           `json:"hlsDisable"`
 	HLSAddress         string         `json:"hlsAddress"`
+	HLSEncryption      bool           `json:"hlsEncryption"`
+	HLSServerKey       string         `json:"hlsServerKey"`
+	HLSServerCert      string         `json:"hlsServerCert"`
 	HLSAlwaysRemux     bool           `json:"hlsAlwaysRemux"`
+	HLSVariant         HLSVariant     `json:"hlsVariant"`
 	HLSSegmentCount    int            `json:"hlsSegmentCount"`
 	HLSSegmentDuration StringDuration `json:"hlsSegmentDuration"`
+	HLSPartDuration    StringDuration `json:"hlsPartDuration"`
+	HLSSegmentMaxSize  StringSize     `json:"hlsSegmentMaxSize"`
 	HLSAllowOrigin     string         `json:"hlsAllowOrigin"`
+	HLSTrustedProxies  IPsOrCIDRs     `json:"hlsTrustedProxies"`
+	HLSDirectory       string         `json:"hlsDirectory"`
+
+	// WebRTC
+	WebRTCDisable           bool       `json:"webrtcDisable"`
+	WebRTCAddress           string     `json:"webrtcAddress"`
+	WebRTCEncryption        bool       `json:"webrtcEncryption"`
+	WebRTCServerKey         string     `json:"webrtcServerKey"`
+	WebRTCServerCert        string     `json:"webrtcServerCert"`
+	WebRTCAllowOrigin       string     `json:"webrtcAllowOrigin"`
+	WebRTCTrustedProxies    IPsOrCIDRs `json:"webrtcTrustedProxies"`
+	WebRTCICEServers        []string   `json:"webrtcICEServers"`
+	WebRTCICEHostNAT1To1IPs []string   `json:"webrtcICEHostNAT1To1IPs"`
+	WebRTCICEUDPMuxAddress  string     `json:"webrtcICEUDPMuxAddress"`
+	WebRTCICETCPMuxAddress  string     `json:"webrtcICETCPMuxAddress"`
 
 	// paths
 	Paths map[string]*PathConf `json:"paths"`
@@ -209,7 +267,12 @@ func Load(fpath string) (*Conf, bool, error) {
 		return nil, false, err
 	}
 
-	err = loadFromEnvironment("RTSP", conf)
+	err = loadFromEnvironment("RTSP", conf) // legacy prefix
+	if err != nil {
+		return nil, false, err
+	}
+
+	err = loadFromEnvironment("MTX", conf)
 	if err != nil {
 		return nil, false, err
 	}
@@ -222,44 +285,69 @@ func Load(fpath string) (*Conf, bool, error) {
 	return conf, found, nil
 }
 
+// Clone clones the configuration.
+func (conf Conf) Clone() *Conf {
+	enc, err := json.Marshal(conf)
+	if err != nil {
+		panic(err)
+	}
+
+	var dest Conf
+	err = json.Unmarshal(enc, &dest)
+	if err != nil {
+		panic(err)
+	}
+
+	return &dest
+}
+
 // CheckAndFillMissing checks the configuration for errors and fills missing parameters.
 func (conf *Conf) CheckAndFillMissing() error {
+	// general
 	if conf.LogLevel == 0 {
 		conf.LogLevel = LogLevel(logger.Info)
 	}
-
 	if len(conf.LogDestinations) == 0 {
 		conf.LogDestinations = LogDestinations{logger.DestinationStdout: {}}
 	}
-
 	if conf.LogFile == "" {
-		conf.LogFile = "rtsp-simple-server.log"
+		conf.LogFile = "mediamtx.log"
 	}
-
 	if conf.ReadTimeout == 0 {
 		conf.ReadTimeout = 10 * StringDuration(time.Second)
 	}
-
 	if conf.WriteTimeout == 0 {
 		conf.WriteTimeout = 10 * StringDuration(time.Second)
 	}
-
 	if conf.ReadBufferCount == 0 {
 		conf.ReadBufferCount = 512
 	}
-
+	if (conf.ReadBufferCount & (conf.ReadBufferCount - 1)) != 0 {
+		return fmt.Errorf("'readBufferCount' must be a power of two")
+	}
+	if conf.UDPMaxPayloadSize == 0 {
+		conf.UDPMaxPayloadSize = 1472
+	}
+	if conf.UDPMaxPayloadSize > 1472 {
+		return fmt.Errorf("'udpMaxPayloadSize' must be less than 1472")
+	}
+	if conf.ExternalAuthenticationURL != "" {
+		if !strings.HasPrefix(conf.ExternalAuthenticationURL, "http://") &&
+			!strings.HasPrefix(conf.ExternalAuthenticationURL, "https://") {
+			return fmt.Errorf("'externalAuthenticationURL' must be a HTTP URL")
+		}
+	}
 	if conf.APIAddress == "" {
 		conf.APIAddress = "127.0.0.1:9997"
 	}
-
 	if conf.MetricsAddress == "" {
 		conf.MetricsAddress = "127.0.0.1:9998"
 	}
-
 	if conf.PPROFAddress == "" {
 		conf.PPROFAddress = "127.0.0.1:9999"
 	}
 
+	// RTSP
 	if len(conf.Protocols) == 0 {
 		conf.Protocols = Protocols{
 			Protocol(gortsplib.TransportUDP):          {},
@@ -267,7 +355,6 @@ func (conf *Conf) CheckAndFillMissing() error {
 			Protocol(gortsplib.TransportTCP):          {},
 		}
 	}
-
 	if conf.Encryption == EncryptionStrict {
 		if _, ok := conf.Protocols[Protocol(gortsplib.TransportUDP)]; ok {
 			return fmt.Errorf("strict encryption can't be used with the UDP transport protocol")
@@ -277,65 +364,89 @@ func (conf *Conf) CheckAndFillMissing() error {
 			return fmt.Errorf("strict encryption can't be used with the UDP-multicast transport protocol")
 		}
 	}
-
 	if conf.RTSPAddress == "" {
 		conf.RTSPAddress = ":8554"
 	}
-
 	if conf.RTSPSAddress == "" {
-		conf.RTSPSAddress = ":8555"
+		conf.RTSPSAddress = ":8322"
 	}
-
 	if conf.RTPAddress == "" {
 		conf.RTPAddress = ":8000"
 	}
-
 	if conf.RTCPAddress == "" {
 		conf.RTCPAddress = ":8001"
 	}
-
 	if conf.MulticastIPRange == "" {
 		conf.MulticastIPRange = "224.1.0.0/16"
 	}
-
 	if conf.MulticastRTPPort == 0 {
 		conf.MulticastRTPPort = 8002
 	}
-
 	if conf.MulticastRTCPPort == 0 {
 		conf.MulticastRTCPPort = 8003
 	}
-
 	if conf.ServerKey == "" {
 		conf.ServerKey = "server.key"
 	}
-
 	if conf.ServerCert == "" {
 		conf.ServerCert = "server.crt"
 	}
-
 	if len(conf.AuthMethods) == 0 {
 		conf.AuthMethods = AuthMethods{headers.AuthBasic, headers.AuthDigest}
 	}
 
+	// RTMP
 	if conf.RTMPAddress == "" {
 		conf.RTMPAddress = ":1935"
 	}
+	if conf.RTMPSAddress == "" {
+		conf.RTMPSAddress = ":1936"
+	}
 
+	// HLS
 	if conf.HLSAddress == "" {
 		conf.HLSAddress = ":8888"
 	}
-
-	if conf.HLSSegmentCount == 0 {
-		conf.HLSSegmentCount = 3
+	if conf.HLSServerKey == "" {
+		conf.HLSServerKey = "server.key"
 	}
-
+	if conf.HLSServerCert == "" {
+		conf.HLSServerCert = "server.crt"
+	}
+	if conf.HLSVariant == 0 {
+		conf.HLSVariant = HLSVariant(gohlslib.MuxerVariantLowLatency)
+	}
+	if conf.HLSSegmentCount == 0 {
+		conf.HLSSegmentCount = 7
+	}
 	if conf.HLSSegmentDuration == 0 {
 		conf.HLSSegmentDuration = 1 * StringDuration(time.Second)
 	}
-
+	if conf.HLSPartDuration == 0 {
+		conf.HLSPartDuration = 200 * StringDuration(time.Millisecond)
+	}
+	if conf.HLSSegmentMaxSize == 0 {
+		conf.HLSSegmentMaxSize = 50 * 1024 * 1024
+	}
 	if conf.HLSAllowOrigin == "" {
 		conf.HLSAllowOrigin = "*"
+	}
+
+	// WebRTC
+	if conf.WebRTCAddress == "" {
+		conf.WebRTCAddress = ":8889"
+	}
+	if conf.WebRTCServerKey == "" {
+		conf.WebRTCServerKey = "server.key"
+	}
+	if conf.WebRTCServerCert == "" {
+		conf.WebRTCServerCert = "server.crt"
+	}
+	if conf.WebRTCAllowOrigin == "" {
+		conf.WebRTCAllowOrigin = "*"
+	}
+	if conf.WebRTCICEServers == nil {
+		conf.WebRTCICEServers = []string{"stun:stun.l.google.com:19302"}
 	}
 
 	// do not add automatically "all", since user may want to
@@ -350,13 +461,22 @@ func (conf *Conf) CheckAndFillMissing() error {
 		delete(conf.Paths, "all")
 	}
 
-	for name, pconf := range conf.Paths {
+	sortedNames := make([]string, len(conf.Paths))
+	i := 0
+	for name := range conf.Paths {
+		sortedNames[i] = name
+		i++
+	}
+	sort.Strings(sortedNames)
+
+	for _, name := range sortedNames {
+		pconf := conf.Paths[name]
 		if pconf == nil {
-			conf.Paths[name] = &PathConf{}
-			pconf = conf.Paths[name]
+			pconf = &PathConf{}
+			conf.Paths[name] = pconf
 		}
 
-		err := pconf.checkAndFillMissing(name)
+		err := pconf.checkAndFillMissing(conf, name)
 		if err != nil {
 			return err
 		}

@@ -5,280 +5,133 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aler9/gortsplib"
-	"github.com/aler9/gortsplib/pkg/base"
+	"github.com/bluenviron/gortsplib/v3"
+	"github.com/bluenviron/gortsplib/v3/pkg/media"
+	"github.com/bluenviron/gortsplib/v3/pkg/url"
+	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
 
-func TestRTSPServerPublishRead(t *testing.T) {
-	for _, ca := range []struct {
-		publisherSoft  string
-		publisherProto string
-		readerSoft     string
-		readerProto    string
-	}{
-		{"ffmpeg", "udp", "ffmpeg", "udp"},
-		{"ffmpeg", "udp", "ffmpeg", "multicast"},
-		{"ffmpeg", "udp", "ffmpeg", "tcp"},
-		{"ffmpeg", "udp", "gstreamer", "udp"},
-		{"ffmpeg", "udp", "gstreamer", "multicast"},
-		{"ffmpeg", "udp", "gstreamer", "tcp"},
-		{"ffmpeg", "udp", "vlc", "udp"},
-		{"ffmpeg", "udp", "vlc", "tcp"},
-		{"ffmpeg", "tcp", "ffmpeg", "udp"},
-		{"gstreamer", "udp", "ffmpeg", "udp"},
-		{"gstreamer", "tcp", "ffmpeg", "udp"},
-		{"ffmpeg", "tls", "ffmpeg", "tls"},
-		{"ffmpeg", "tls", "gstreamer", "tls"},
-		{"gstreamer", "tls", "ffmpeg", "tls"},
-	} {
-		t.Run(ca.publisherSoft+"_"+ca.publisherProto+"_"+
-			ca.readerSoft+"_"+ca.readerProto, func(t *testing.T) {
-			var proto string
-			var port string
-			if ca.publisherProto != "tls" {
-				proto = "rtsp"
-				port = "8554"
+func TestRTSPServerRunOnConnect(t *testing.T) {
+	f, err := os.CreateTemp(os.TempDir(), "rtspss-runonconnect-")
+	require.NoError(t, err)
+	f.Close()
+	defer os.Remove(f.Name())
 
-				p, ok := newInstance("rtmpDisable: yes\n" +
-					"hlsDisable: yes\n" +
-					"readTimeout: 20s\n" +
-					"paths:\n" +
-					"  all:\n")
-				require.Equal(t, true, ok)
-				defer p.close()
-			} else {
-				proto = "rtsps"
-				port = "8555"
+	p, ok := newInstance(
+		"runOnConnect: sh -c 'echo aa > " + f.Name() + "'\n" +
+			"paths:\n" +
+			"  all:\n")
+	require.Equal(t, true, ok)
+	defer p.Close()
 
-				serverCertFpath, err := writeTempFile(serverCert)
-				require.NoError(t, err)
-				defer os.Remove(serverCertFpath)
+	source := gortsplib.Client{}
 
-				serverKeyFpath, err := writeTempFile(serverKey)
-				require.NoError(t, err)
-				defer os.Remove(serverKeyFpath)
+	err = source.StartRecording(
+		"rtsp://127.0.0.1:8554/mypath",
+		media.Medias{testMediaH264})
+	require.NoError(t, err)
+	defer source.Close()
 
-				p, ok := newInstance("rtmpDisable: yes\n" +
-					"hlsDisable: yes\n" +
-					"readTimeout: 20s\n" +
-					"protocols: [tcp]\n" +
-					"encryption: \"yes\"\n" +
-					"serverCert: " + serverCertFpath + "\n" +
-					"serverKey: " + serverKeyFpath + "\n" +
-					"paths:\n" +
-					"  all:\n")
-				require.Equal(t, true, ok)
-				defer p.close()
-			}
+	time.Sleep(500 * time.Millisecond)
 
-			switch ca.publisherSoft {
-			case "ffmpeg":
-				ps := func() string {
-					switch ca.publisherProto {
-					case "udp", "tcp":
-						return ca.publisherProto
-
-					default: // tls
-						return "tcp"
-					}
-				}()
-
-				cnt1, err := newContainer("ffmpeg", "source", []string{
-					"-re",
-					"-stream_loop", "-1",
-					"-i", "emptyvideo.mkv",
-					"-c", "copy",
-					"-f", "rtsp",
-					"-rtsp_transport",
-					ps,
-					proto + "://localhost:" + port + "/teststream",
-				})
-				require.NoError(t, err)
-				defer cnt1.close()
-
-				time.Sleep(1 * time.Second)
-
-			case "gstreamer":
-				ps := func() string {
-					switch ca.publisherProto {
-					case "udp", "tcp":
-						return ca.publisherProto
-
-					default: // tls
-						return "tcp"
-					}
-				}()
-
-				cnt1, err := newContainer("gstreamer", "source", []string{
-					"filesrc location=emptyvideo.mkv ! matroskademux ! video/x-h264 ! rtspclientsink " +
-						"location=" + proto + "://localhost:" + port + "/teststream " +
-						"protocols=" + ps + " tls-validation-flags=0 latency=0 timeout=0 rtx-time=0",
-				})
-				require.NoError(t, err)
-				defer cnt1.close()
-
-				time.Sleep(1 * time.Second)
-			}
-
-			time.Sleep(1 * time.Second)
-
-			switch ca.readerSoft {
-			case "ffmpeg":
-				ps := func() string {
-					switch ca.readerProto {
-					case "udp", "tcp":
-						return ca.publisherProto
-
-					case "multicast":
-						return "udp_multicast"
-
-					default: // tls
-						return "tcp"
-					}
-				}()
-
-				cnt2, err := newContainer("ffmpeg", "dest", []string{
-					"-rtsp_transport", ps,
-					"-i", proto + "://localhost:" + port + "/teststream",
-					"-vframes", "1",
-					"-f", "image2",
-					"-y", "/dev/null",
-				})
-				require.NoError(t, err)
-				defer cnt2.close()
-				require.Equal(t, 0, cnt2.wait())
-
-			case "gstreamer":
-				ps := func() string {
-					switch ca.readerProto {
-					case "udp", "tcp":
-						return ca.publisherProto
-
-					case "multicast":
-						return "udp-mcast"
-
-					default: // tls
-						return "tcp"
-					}
-				}()
-
-				cnt2, err := newContainer("gstreamer", "read", []string{
-					"rtspsrc location=" + proto + "://127.0.0.1:" + port + "/teststream " +
-						"protocols=" + ps + " " +
-						"tls-validation-flags=0 latency=0 " +
-						"! application/x-rtp,media=video ! decodebin ! exitafterframe ! fakesink",
-				})
-				require.NoError(t, err)
-				defer cnt2.close()
-				require.Equal(t, 0, cnt2.wait())
-
-			case "vlc":
-				args := []string{}
-				if ca.readerProto == "tcp" {
-					args = append(args, "--rtsp-tcp")
-				}
-				args = append(args, proto+"://localhost:"+port+"/teststream")
-				cnt2, err := newContainer("vlc", "dest", args)
-				require.NoError(t, err)
-				defer cnt2.close()
-				require.Equal(t, 0, cnt2.wait())
-			}
-		})
-	}
+	byts, err := os.ReadFile(f.Name())
+	require.NoError(t, err)
+	require.Equal(t, "aa\n", string(byts))
 }
 
 func TestRTSPServerAuth(t *testing.T) {
-	t.Run("publish", func(t *testing.T) {
-		p, ok := newInstance("rtmpDisable: yes\n" +
-			"hlsDisable: yes\n" +
-			"paths:\n" +
-			"  all:\n" +
-			"    publishUser: testuser\n" +
-			"    publishPass: test!$()*+.;<=>[]^_-{}\n" +
-			"    publishIPs: [127.0.0.0/16]\n")
-		require.Equal(t, true, ok)
-		defer p.close()
-
-		track, err := gortsplib.NewTrackH264(96,
-			&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x01, 0x02, 0x03, 0x04}})
-		require.NoError(t, err)
-
-		source, err := gortsplib.DialPublish(
-			"rtsp://testuser:test%21%24%28%29%2A%2B.%3B%3C%3D%3E%5B%5D%5E_-%7B%7D@127.0.0.1:8554/test/stream",
-			gortsplib.Tracks{track})
-		require.NoError(t, err)
-		defer source.Close()
-	})
-
-	for _, soft := range []string{
-		"ffmpeg",
-		"vlc",
+	for _, ca := range []string{
+		"internal",
+		"external",
 	} {
-		t.Run("read_"+soft, func(t *testing.T) {
-			p, ok := newInstance("rtmpDisable: yes\n" +
-				"hlsDisable: yes\n" +
-				"paths:\n" +
-				"  all:\n" +
-				"    readUser: testuser\n" +
-				"    readPass: test!$()*+.;<=>[]^_-{}\n" +
-				"    readIPs: [127.0.0.0/16]\n")
-			require.Equal(t, true, ok)
-			defer p.close()
-
-			cnt1, err := newContainer("ffmpeg", "source", []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "emptyvideo.mkv",
-				"-c", "copy",
-				"-f", "rtsp",
-				"-rtsp_transport", "udp",
-				"rtsp://localhost:8554/test/stream",
-			})
-			require.NoError(t, err)
-			defer cnt1.close()
-
-			time.Sleep(1 * time.Second)
-
-			if soft == "ffmpeg" {
-				cnt2, err := newContainer("ffmpeg", "dest", []string{
-					"-rtsp_transport", "udp",
-					"-i", "rtsp://testuser:test!$()*+.;<=>[]^_-{}@127.0.0.1:8554/test/stream",
-					"-vframes", "1",
-					"-f", "image2",
-					"-y", "/dev/null",
-				})
-				require.NoError(t, err)
-				defer cnt2.close()
-				require.Equal(t, 0, cnt2.wait())
+		t.Run(ca, func(t *testing.T) {
+			var conf string
+			if ca == "internal" {
+				conf = "rtmpDisable: yes\n" +
+					"hlsDisable: yes\n" +
+					"webrtcDisable: yes\n" +
+					"paths:\n" +
+					"  all:\n" +
+					"    publishUser: testpublisher\n" +
+					"    publishPass: testpass\n" +
+					"    publishIPs: [127.0.0.0/16]\n" +
+					"    readUser: testreader\n" +
+					"    readPass: testpass\n" +
+					"    readIPs: [127.0.0.0/16]\n"
 			} else {
-				cnt2, err := newContainer("vlc", "dest", []string{
-					"rtsp://testuser:test!$()*+.;<=>[]^_-{}@localhost:8554/test/stream",
-				})
-				require.NoError(t, err)
-				defer cnt2.close()
-				require.Equal(t, 0, cnt2.wait())
+				conf = "externalAuthenticationURL: http://localhost:9120/auth\n" +
+					"paths:\n" +
+					"  all:\n"
 			}
+
+			p, ok := newInstance(conf)
+			require.Equal(t, true, ok)
+			defer p.Close()
+
+			var a *testHTTPAuthenticator
+			if ca == "external" {
+				var err error
+				a, err = newTestHTTPAuthenticator("rtsp", "publish")
+				require.NoError(t, err)
+			}
+
+			medi := testMediaH264
+
+			source := gortsplib.Client{}
+
+			err := source.StartRecording(
+				"rtsp://testpublisher:testpass@127.0.0.1:8554/teststream?param=value",
+				media.Medias{medi})
+			require.NoError(t, err)
+			defer source.Close()
+
+			if ca == "external" {
+				a.close()
+				var err error
+				a, err = newTestHTTPAuthenticator("rtsp", "read")
+				require.NoError(t, err)
+				defer a.close()
+			}
+
+			reader := gortsplib.Client{}
+
+			u, err := url.Parse("rtsp://testreader:testpass@127.0.0.1:8554/teststream?param=value")
+			require.NoError(t, err)
+
+			err = reader.Start(u.Scheme, u.Host)
+			require.NoError(t, err)
+			defer reader.Close()
+
+			medias, baseURL, _, err := reader.Describe(u)
+			require.NoError(t, err)
+
+			err = reader.SetupAll(medias, baseURL)
+			require.NoError(t, err)
+
+			_, err = reader.Play(nil)
+			require.NoError(t, err)
 		})
 	}
 
 	t.Run("hashed", func(t *testing.T) {
 		p, ok := newInstance("rtmpDisable: yes\n" +
 			"hlsDisable: yes\n" +
+			"webrtcDisable: yes\n" +
 			"paths:\n" +
 			"  all:\n" +
 			"    publishUser: sha256:rl3rgi4NcZkpAEcacZnQ2VuOfJ0FxAqCRaKB/SwdZoQ=\n" +
 			"    publishPass: sha256:E9JJ8stBJ7QM+nV4ZoUCeHk/gU3tPFh/5YieiJp6n2w=\n")
 		require.Equal(t, true, ok)
-		defer p.close()
+		defer p.Close()
 
-		track, err := gortsplib.NewTrackH264(96,
-			&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x01, 0x02, 0x03, 0x04}})
-		require.NoError(t, err)
+		medi := testMediaH264
 
-		source, err := gortsplib.DialPublish(
+		source := gortsplib.Client{}
+
+		err := source.StartRecording(
 			"rtsp://testuser:testpass@127.0.0.1:8554/test/stream",
-			gortsplib.Tracks{track})
+			media.Medias{medi})
 		require.NoError(t, err)
 		defer source.Close()
 	})
@@ -309,20 +162,21 @@ func TestRTSPServerAuthFail(t *testing.T) {
 		t.Run("publish_"+ca.name, func(t *testing.T) {
 			p, ok := newInstance("rtmpDisable: yes\n" +
 				"hlsDisable: yes\n" +
+				"webrtcDisable: yes\n" +
 				"paths:\n" +
 				"  all:\n" +
 				"    publishUser: testuser\n" +
 				"    publishPass: testpass\n")
 			require.Equal(t, true, ok)
-			defer p.close()
+			defer p.Close()
 
-			track, err := gortsplib.NewTrackH264(96,
-				&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x01, 0x02, 0x03, 0x04}})
-			require.NoError(t, err)
+			medi := testMediaH264
 
-			_, err = gortsplib.DialPublish(
+			c := gortsplib.Client{}
+
+			err := c.StartRecording(
 				"rtsp://"+ca.user+":"+ca.pass+"@localhost:8554/test/stream",
-				gortsplib.Tracks{track},
+				media.Medias{medi},
 			)
 			require.EqualError(t, err, "bad status code: 401 (Unauthorized)")
 		})
@@ -352,16 +206,24 @@ func TestRTSPServerAuthFail(t *testing.T) {
 		t.Run("read_"+ca.name, func(t *testing.T) {
 			p, ok := newInstance("rtmpDisable: yes\n" +
 				"hlsDisable: yes\n" +
+				"webrtcDisable: yes\n" +
 				"paths:\n" +
 				"  all:\n" +
 				"    readUser: testuser\n" +
 				"    readPass: testpass\n")
 			require.Equal(t, true, ok)
-			defer p.close()
+			defer p.Close()
 
-			_, err := gortsplib.DialRead(
-				"rtsp://" + ca.user + ":" + ca.pass + "@localhost:8554/test/stream",
-			)
+			c := gortsplib.Client{}
+
+			u, err := url.Parse("rtsp://" + ca.user + ":" + ca.pass + "@localhost:8554/test/stream")
+			require.NoError(t, err)
+
+			err = c.Start(u.Scheme, u.Host)
+			require.NoError(t, err)
+			defer c.Close()
+
+			_, _, _, err = c.Describe(u)
 			require.EqualError(t, err, "bad status code: 401 (Unauthorized)")
 		})
 	}
@@ -369,19 +231,42 @@ func TestRTSPServerAuthFail(t *testing.T) {
 	t.Run("ip", func(t *testing.T) {
 		p, ok := newInstance("rtmpDisable: yes\n" +
 			"hlsDisable: yes\n" +
+			"webrtcDisable: yes\n" +
 			"paths:\n" +
 			"  all:\n" +
 			"    publishIPs: [128.0.0.1/32]\n")
 		require.Equal(t, true, ok)
-		defer p.close()
+		defer p.Close()
 
-		track, err := gortsplib.NewTrackH264(96,
-			&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x01, 0x02, 0x03, 0x04}})
-		require.NoError(t, err)
+		medi := testMediaH264
 
-		_, err = gortsplib.DialPublish(
+		c := gortsplib.Client{}
+
+		err := c.StartRecording(
 			"rtsp://localhost:8554/test/stream",
-			gortsplib.Tracks{track},
+			media.Medias{medi},
+		)
+		require.EqualError(t, err, "bad status code: 401 (Unauthorized)")
+	})
+
+	t.Run("external", func(t *testing.T) {
+		p, ok := newInstance("externalAuthenticationURL: http://localhost:9120/auth\n" +
+			"paths:\n" +
+			"  all:\n")
+		require.Equal(t, true, ok)
+		defer p.Close()
+
+		a, err := newTestHTTPAuthenticator("rtsp", "publish")
+		require.NoError(t, err)
+		defer a.close()
+
+		medi := testMediaH264
+
+		c := gortsplib.Client{}
+
+		err = c.StartRecording(
+			"rtsp://testpublisher2:testpass@localhost:8554/teststream?param=value",
+			media.Medias{medi},
 		)
 		require.EqualError(t, err, "bad status code: 401 (Unauthorized)")
 	})
@@ -394,7 +279,6 @@ func TestRTSPServerPublisherOverride(t *testing.T) {
 	} {
 		t.Run(ca, func(t *testing.T) {
 			conf := "rtmpDisable: yes\n" +
-				"protocols: [tcp]\n" +
 				"paths:\n" +
 				"  all:\n"
 
@@ -404,19 +288,19 @@ func TestRTSPServerPublisherOverride(t *testing.T) {
 
 			p, ok := newInstance(conf)
 			require.Equal(t, true, ok)
-			defer p.close()
+			defer p.Close()
 
-			track, err := gortsplib.NewTrackH264(96,
-				&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x01, 0x02, 0x03, 0x04}})
-			require.NoError(t, err)
+			medi := testMediaH264
 
-			s1, err := gortsplib.DialPublish("rtsp://localhost:8554/teststream",
-				gortsplib.Tracks{track})
+			s1 := gortsplib.Client{}
+
+			err := s1.StartRecording("rtsp://localhost:8554/teststream", media.Medias{medi})
 			require.NoError(t, err)
 			defer s1.Close()
 
-			s2, err := gortsplib.DialPublish("rtsp://localhost:8554/teststream",
-				gortsplib.Tracks{track})
+			s2 := gortsplib.Client{}
+
+			err = s2.StartRecording("rtsp://localhost:8554/teststream", media.Medias{medi})
 			if ca == "enabled" {
 				require.NoError(t, err)
 				defer s2.Close()
@@ -424,83 +308,69 @@ func TestRTSPServerPublisherOverride(t *testing.T) {
 				require.Error(t, err)
 			}
 
-			d1, err := gortsplib.DialRead("rtsp://localhost:8554/teststream")
-			require.NoError(t, err)
-			defer d1.Close()
-
-			readDone := make(chan struct{})
 			frameRecv := make(chan struct{})
-			go func() {
-				defer close(readDone)
-				d1.ReadFrames(func(trackID int, streamType base.StreamType, payload []byte) {
-					if streamType == gortsplib.StreamTypeRTP {
-						if ca == "enabled" {
-							require.Equal(t, []byte{0x05, 0x06, 0x07, 0x08}, payload)
-						} else {
-							require.Equal(t, []byte{0x01, 0x02, 0x03, 0x04}, payload)
-						}
-						close(frameRecv)
-					}
+
+			c := gortsplib.Client{}
+
+			u, err := url.Parse("rtsp://localhost:8554/teststream")
+			require.NoError(t, err)
+
+			err = c.Start(u.Scheme, u.Host)
+			require.NoError(t, err)
+			defer c.Close()
+
+			medias, baseURL, _, err := c.Describe(u)
+			require.NoError(t, err)
+
+			err = c.SetupAll(medias, baseURL)
+			require.NoError(t, err)
+
+			c.OnPacketRTP(medias[0], medias[0].Formats[0], func(pkt *rtp.Packet) {
+				if ca == "enabled" {
+					require.Equal(t, []byte{0x05, 0x06, 0x07, 0x08}, pkt.Payload)
+				} else {
+					require.Equal(t, []byte{0x01, 0x02, 0x03, 0x04}, pkt.Payload)
+				}
+				close(frameRecv)
+			})
+
+			_, err = c.Play(nil)
+			require.NoError(t, err)
+
+			if ca == "enabled" {
+				err := s1.Wait()
+				require.EqualError(t, err, "EOF")
+
+				err = s2.WritePacketRTP(medi, &rtp.Packet{
+					Header: rtp.Header{
+						Version:        0x02,
+						PayloadType:    96,
+						SequenceNumber: 57899,
+						Timestamp:      345234345,
+						SSRC:           978651231,
+						Marker:         true,
+					},
+					Payload: []byte{0x05, 0x06, 0x07, 0x08},
 				})
-			}()
-
-			err = s1.WriteFrame(0, gortsplib.StreamTypeRTP,
-				[]byte{0x01, 0x02, 0x03, 0x04})
-			if ca == "enabled" {
-				require.Error(t, err)
-			} else {
 				require.NoError(t, err)
-			}
-
-			if ca == "enabled" {
-				err = s2.WriteFrame(0, gortsplib.StreamTypeRTP,
-					[]byte{0x05, 0x06, 0x07, 0x08})
+			} else {
+				err = s1.WritePacketRTP(medi, &rtp.Packet{
+					Header: rtp.Header{
+						Version:        0x02,
+						PayloadType:    96,
+						SequenceNumber: 57899,
+						Timestamp:      345234345,
+						SSRC:           978651231,
+						Marker:         true,
+					},
+					Payload: []byte{0x01, 0x02, 0x03, 0x04},
+				})
 				require.NoError(t, err)
 			}
 
 			<-frameRecv
-
-			d1.Close()
-			<-readDone
 		})
 	}
-}
-
-func TestRTSPServerRedirect(t *testing.T) {
-	p1, ok := newInstance("rtmpDisable: yes\n" +
-		"hlsDisable: yes\n" +
-		"paths:\n" +
-		"  path1:\n" +
-		"    source: redirect\n" +
-		"    sourceRedirect: rtsp://localhost:8554/path2\n" +
-		"  path2:\n")
-	require.Equal(t, true, ok)
-	defer p1.close()
-
-	cnt1, err := newContainer("ffmpeg", "source", []string{
-		"-re",
-		"-stream_loop", "-1",
-		"-i", "emptyvideo.mkv",
-		"-c", "copy",
-		"-f", "rtsp",
-		"-rtsp_transport", "udp",
-		"rtsp://localhost:8554/path2",
-	})
-	require.NoError(t, err)
-	defer cnt1.close()
-
-	time.Sleep(1 * time.Second)
-
-	cnt2, err := newContainer("ffmpeg", "dest", []string{
-		"-rtsp_transport", "udp",
-		"-i", "rtsp://localhost:8554/path1",
-		"-vframes", "1",
-		"-f", "image2",
-		"-y", "/dev/null",
-	})
-	require.NoError(t, err)
-	defer cnt2.close()
-	require.Equal(t, 0, cnt2.wait())
 }
 
 func TestRTSPServerFallback(t *testing.T) {
@@ -518,37 +388,31 @@ func TestRTSPServerFallback(t *testing.T) {
 
 			p1, ok := newInstance("rtmpDisable: yes\n" +
 				"hlsDisable: yes\n" +
+				"webrtcDisable: yes\n" +
 				"paths:\n" +
 				"  path1:\n" +
 				"    fallback: " + val + "\n" +
 				"  path2:\n")
 			require.Equal(t, true, ok)
-			defer p1.close()
+			defer p1.Close()
 
-			cnt1, err := newContainer("ffmpeg", "source", []string{
-				"-re",
-				"-stream_loop", "-1",
-				"-i", "emptyvideo.mkv",
-				"-c", "copy",
-				"-f", "rtsp",
-				"-rtsp_transport", "udp",
-				"rtsp://localhost:8554/path2",
-			})
+			source := gortsplib.Client{}
+			err := source.StartRecording("rtsp://localhost:8554/path2",
+				media.Medias{testMediaH264})
 			require.NoError(t, err)
-			defer cnt1.close()
+			defer source.Close()
 
-			time.Sleep(1 * time.Second)
-
-			cnt2, err := newContainer("ffmpeg", "dest", []string{
-				"-rtsp_transport", "udp",
-				"-i", "rtsp://localhost:8554/path1",
-				"-vframes", "1",
-				"-f", "image2",
-				"-y", "/dev/null",
-			})
+			u, err := url.Parse("rtsp://localhost:8554/path1")
 			require.NoError(t, err)
-			defer cnt2.close()
-			require.Equal(t, 0, cnt2.wait())
+
+			dest := gortsplib.Client{}
+			err = dest.Start(u.Scheme, u.Host)
+			require.NoError(t, err)
+			defer dest.Close()
+
+			medias, _, _, err := dest.Describe(u)
+			require.NoError(t, err)
+			require.Equal(t, 1, len(medias))
 		})
 	}
 }

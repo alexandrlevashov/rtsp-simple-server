@@ -1,19 +1,21 @@
 package core
 
 import (
+	"bufio"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
-	"github.com/aler9/gortsplib"
-	"github.com/aler9/gortsplib/pkg/base"
-	"github.com/aler9/gortsplib/pkg/headers"
-	psdp "github.com/pion/sdp/v3"
+	"github.com/bluenviron/gortsplib/v3"
+	"github.com/bluenviron/gortsplib/v3/pkg/base"
+	"github.com/bluenviron/gortsplib/v3/pkg/headers"
+	"github.com/bluenviron/gortsplib/v3/pkg/media"
+	"github.com/bluenviron/gortsplib/v3/pkg/sdp"
+	"github.com/bluenviron/gortsplib/v3/pkg/url"
 	"github.com/stretchr/testify/require"
 )
 
@@ -69,62 +71,8 @@ y++U32uuSFiXDcSLarfIsE992MEJLSAynbF1Rsgsr3gXbGiuToJRyxbIeVy7gwzD
 -----END RSA PRIVATE KEY-----
 `)
 
-type container struct {
-	name string
-}
-
-func newContainer(image string, name string, args []string) (*container, error) {
-	c := &container{
-		name: name,
-	}
-
-	exec.Command("docker", "kill", "rtsp-simple-server-test-"+name).Run()
-	exec.Command("docker", "wait", "rtsp-simple-server-test-"+name).Run()
-
-	// --network=host is needed to test multicast
-	cmd := []string{
-		"docker", "run",
-		"--network=host",
-		"--name=rtsp-simple-server-test-" + name,
-		"rtsp-simple-server-test-" + image,
-	}
-	cmd = append(cmd, args...)
-	ecmd := exec.Command(cmd[0], cmd[1:]...)
-	ecmd.Stdout = nil
-	ecmd.Stderr = os.Stderr
-
-	err := ecmd.Start()
-	if err != nil {
-		return nil, err
-	}
-
-	time.Sleep(1 * time.Second)
-
-	return c, nil
-}
-
-func (c *container) close() {
-	exec.Command("docker", "kill", "rtsp-simple-server-test-"+c.name).Run()
-	exec.Command("docker", "wait", "rtsp-simple-server-test-"+c.name).Run()
-	exec.Command("docker", "rm", "rtsp-simple-server-test-"+c.name).Run()
-}
-
-func (c *container) wait() int {
-	exec.Command("docker", "wait", "rtsp-simple-server-test-"+c.name).Run()
-	out, _ := exec.Command("docker", "inspect", "rtsp-simple-server-test-"+c.name,
-		"-f", "{{.State.ExitCode}}").Output()
-	code, _ := strconv.ParseInt(string(out[:len(out)-1]), 10, 64)
-	return int(code)
-}
-
-func (c *container) ip() string {
-	out, _ := exec.Command("docker", "inspect", "rtsp-simple-server-test-"+c.name,
-		"-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}").Output()
-	return string(out[:len(out)-1])
-}
-
 func writeTempFile(byts []byte) (string, error) {
-	tmpf, err := ioutil.TempFile(os.TempDir(), "rtsp-")
+	tmpf, err := os.CreateTemp(os.TempDir(), "rtsp-")
 	if err != nil {
 		return "", err
 	}
@@ -158,41 +106,69 @@ func TestCorePathAutoDeletion(t *testing.T) {
 			p, ok := newInstance("paths:\n" +
 				"  all:\n")
 			require.Equal(t, true, ok)
-			defer p.close()
+			defer p.Close()
 
 			func() {
-				conn, err := gortsplib.Dial("rtsp", "localhost:8554")
+				conn, err := net.Dial("tcp", "localhost:8554")
 				require.NoError(t, err)
 				defer conn.Close()
+				br := bufio.NewReader(conn)
 
 				if ca == "describe" {
-					ur, err := base.ParseURL("rtsp://localhost:8554/mypath")
+					u, err := url.Parse("rtsp://localhost:8554/mypath")
 					require.NoError(t, err)
 
-					_, _, _, err = conn.Describe(ur)
-					require.EqualError(t, err, "bad status code: 404 (Not Found)")
+					byts, _ := base.Request{
+						Method: base.Describe,
+						URL:    u,
+						Header: base.Header{
+							"CSeq": base.HeaderValue{"1"},
+						},
+					}.Marshal()
+					_, err = conn.Write(byts)
+					require.NoError(t, err)
+
+					var res base.Response
+					err = res.Unmarshal(br)
+					require.NoError(t, err)
+					require.Equal(t, base.StatusNotFound, res.StatusCode)
 				} else {
-					baseURL, err := base.ParseURL("rtsp://localhost:8554/mypath/")
+					u, err := url.Parse("rtsp://localhost:8554/mypath/trackID=0")
 					require.NoError(t, err)
 
-					track, err := gortsplib.NewTrackH264(96,
-						&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x01, 0x02, 0x03, 0x04}})
+					byts, _ := base.Request{
+						Method: base.Setup,
+						URL:    u,
+						Header: base.Header{
+							"CSeq": base.HeaderValue{"1"},
+							"Transport": headers.Transport{
+								Mode: func() *headers.TransportMode {
+									v := headers.TransportModePlay
+									return &v
+								}(),
+								Delivery: func() *headers.TransportDelivery {
+									v := headers.TransportDeliveryUnicast
+									return &v
+								}(),
+								Protocol:    headers.TransportProtocolUDP,
+								ClientPorts: &[2]int{35466, 35467},
+							}.Marshal(),
+						},
+					}.Marshal()
+					_, err = conn.Write(byts)
 					require.NoError(t, err)
 
-					track.Media.Attributes = append(track.Media.Attributes, psdp.Attribute{
-						Key:   "control",
-						Value: "trackID=0",
-					})
-
-					_, err = conn.Setup(headers.TransportModePlay, baseURL, track, 0, 0)
-					require.EqualError(t, err, "bad status code: 404 (Not Found)")
+					var res base.Response
+					err = res.Unmarshal(br)
+					require.NoError(t, err)
+					require.Equal(t, base.StatusNotFound, res.StatusCode)
 				}
 			}()
 
-			res := p.pathManager.onAPIPathsList(pathAPIPathsListReq{})
-			require.NoError(t, res.Err)
+			res := p.pathManager.apiPathsList()
+			require.NoError(t, res.err)
 
-			require.Equal(t, 0, len(res.Data.Items))
+			require.Equal(t, 0, len(res.data.Items))
 		})
 	}
 }
@@ -201,27 +177,38 @@ func TestCorePathRunOnDemand(t *testing.T) {
 	doneFile := filepath.Join(os.TempDir(), "ondemand_done")
 
 	srcFile := filepath.Join(os.TempDir(), "ondemand.go")
-	err := ioutil.WriteFile(srcFile, []byte(`
+	err := os.WriteFile(srcFile, []byte(`
 package main
 
 import (
 	"os"
 	"os/signal"
 	"syscall"
-	"io/ioutil"
-	"github.com/aler9/gortsplib"
+	"github.com/bluenviron/gortsplib/v3"
+	"github.com/bluenviron/gortsplib/v3/pkg/media"
+	"github.com/bluenviron/gortsplib/v3/pkg/formats"
 )
 
 func main() {
-	track, err := gortsplib.NewTrackH264(96,
-		&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x01, 0x02, 0x03, 0x04}})
-	if err != nil {
-		panic(err)
+	if os.Getenv("G1") != "on" {
+		panic("environment not set")
 	}
 
-	source, err := gortsplib.DialPublish(
+	medi := &media.Media{
+		Type: media.TypeVideo,
+		Formats: []formats.Format{&formats.H264{
+			PayloadTyp: 96,
+			SPS: []byte{0x01, 0x02, 0x03, 0x04},
+			PPS: []byte{0x01, 0x02, 0x03, 0x04},
+			PacketizationMode: 1,
+		}},
+	}
+
+	source := gortsplib.Client{}
+
+	err := source.StartRecording(
 		"rtsp://localhost:" + os.Getenv("RTSP_PORT") + "/" + os.Getenv("RTSP_PATH"),
-		gortsplib.Tracks{track})
+		media.Medias{medi})
 	if err != nil {
 		panic(err)
 	}
@@ -231,7 +218,7 @@ func main() {
 	signal.Notify(c, syscall.SIGINT)
 	<-c
 
-	err = ioutil.WriteFile("`+doneFile+`", []byte(""), 0644)
+	err = os.WriteFile("`+doneFile+`", []byte(""), 0644)
 	if err != nil {
 		panic(err)
 	}
@@ -255,41 +242,75 @@ func main() {
 
 			p1, ok := newInstance(fmt.Sprintf("rtmpDisable: yes\n"+
 				"hlsDisable: yes\n"+
+				"webrtcDisable: yes\n"+
 				"paths:\n"+
-				"  all:\n"+
+				"  '~^(on)demand$':\n"+
 				"    runOnDemand: %s\n"+
 				"    runOnDemandCloseAfter: 1s\n", execFile))
 			require.Equal(t, true, ok)
-			defer p1.close()
+			defer p1.Close()
+
+			var control string
 
 			func() {
-				conn, err := gortsplib.Dial("rtsp", "localhost:8554")
+				conn, err := net.Dial("tcp", "localhost:8554")
 				require.NoError(t, err)
 				defer conn.Close()
+				br := bufio.NewReader(conn)
 
 				if ca == "describe" || ca == "describe and setup" {
-					ur, err := base.ParseURL("rtsp://localhost:8554/ondemand")
+					u, err := url.Parse("rtsp://localhost:8554/ondemand")
 					require.NoError(t, err)
 
-					_, _, _, err = conn.Describe(ur)
+					byts, _ := base.Request{
+						Method: base.Describe,
+						URL:    u,
+						Header: base.Header{
+							"CSeq": base.HeaderValue{"1"},
+						},
+					}.Marshal()
+					_, err = conn.Write(byts)
 					require.NoError(t, err)
+
+					var res base.Response
+					err = res.Unmarshal(br)
+					require.NoError(t, err)
+					require.Equal(t, base.StatusOK, res.StatusCode)
+
+					var desc sdp.SessionDescription
+					err = desc.Unmarshal(res.Body)
+					require.NoError(t, err)
+					control, _ = desc.MediaDescriptions[0].Attribute("control")
+				} else {
+					control = "rtsp://localhost:8554/ondemand/"
 				}
 
 				if ca == "setup" || ca == "describe and setup" {
-					baseURL, err := base.ParseURL("rtsp://localhost:8554/ondemand/")
+					u, err := url.Parse(control)
 					require.NoError(t, err)
 
-					track, err := gortsplib.NewTrackH264(96,
-						&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x01, 0x02, 0x03, 0x04}})
+					byts, _ := base.Request{
+						Method: base.Setup,
+						URL:    u,
+						Header: base.Header{
+							"CSeq": base.HeaderValue{"2"},
+							"Transport": headers.Transport{
+								Mode: func() *headers.TransportMode {
+									v := headers.TransportModePlay
+									return &v
+								}(),
+								Protocol:       headers.TransportProtocolTCP,
+								InterleavedIDs: &[2]int{0, 1},
+							}.Marshal(),
+						},
+					}.Marshal()
+					_, err = conn.Write(byts)
 					require.NoError(t, err)
 
-					track.Media.Attributes = append(track.Media.Attributes, psdp.Attribute{
-						Key:   "control",
-						Value: "trackID=0",
-					})
-
-					_, err = conn.Setup(headers.TransportModePlay, baseURL, track, 0, 0)
+					var res base.Response
+					err = res.Unmarshal(br)
 					require.NoError(t, err)
+					require.Equal(t, base.StatusOK, res.StatusCode)
 				}
 			}()
 
@@ -304,10 +325,40 @@ func main() {
 	}
 }
 
+func TestCorePathRunOnReady(t *testing.T) {
+	doneFile := filepath.Join(os.TempDir(), "onready_done")
+	defer os.Remove(doneFile)
+
+	p, ok := newInstance(fmt.Sprintf("rtmpDisable: yes\n"+
+		"hlsDisable: yes\n"+
+		"webrtcDisable: yes\n"+
+		"paths:\n"+
+		"  test:\n"+
+		"    runOnReady: touch %s\n",
+		doneFile))
+	require.Equal(t, true, ok)
+	defer p.Close()
+
+	medi := testMediaH264
+
+	c := gortsplib.Client{}
+
+	err := c.StartRecording(
+		"rtsp://localhost:8554/test",
+		media.Medias{medi})
+	require.NoError(t, err)
+	defer c.Close()
+
+	time.Sleep(1 * time.Second)
+
+	_, err = os.Stat(doneFile)
+	require.NoError(t, err)
+}
+
 func TestCoreHotReloading(t *testing.T) {
 	confPath := filepath.Join(os.TempDir(), "rtsp-conf")
 
-	err := ioutil.WriteFile(confPath, []byte("paths:\n"+
+	err := os.WriteFile(confPath, []byte("paths:\n"+
 		"  test1:\n"+
 		"    publishUser: myuser\n"+
 		"    publishPass: mypass\n"),
@@ -317,20 +368,17 @@ func TestCoreHotReloading(t *testing.T) {
 
 	p, ok := New([]string{confPath})
 	require.Equal(t, true, ok)
-	defer p.close()
+	defer p.Close()
 
 	func() {
-		track, err := gortsplib.NewTrackH264(96,
-			&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x01, 0x02, 0x03, 0x04}})
-		require.NoError(t, err)
+		medi := testMediaH264
 
-		_, err = gortsplib.DialPublish(
-			"rtsp://localhost:8554/test1",
-			gortsplib.Tracks{track})
+		c := gortsplib.Client{}
+		err = c.StartRecording("rtsp://localhost:8554/test1", media.Medias{medi})
 		require.EqualError(t, err, "bad status code: 401 (Unauthorized)")
 	}()
 
-	err = ioutil.WriteFile(confPath, []byte("paths:\n"+
+	err = os.WriteFile(confPath, []byte("paths:\n"+
 		"  test1:\n"),
 		0o644)
 	require.NoError(t, err)
@@ -338,13 +386,10 @@ func TestCoreHotReloading(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	func() {
-		track, err := gortsplib.NewTrackH264(96,
-			&gortsplib.TrackConfigH264{SPS: []byte{0x01, 0x02, 0x03, 0x04}, PPS: []byte{0x01, 0x02, 0x03, 0x04}})
-		require.NoError(t, err)
+		medi := testMediaH264
 
-		conn, err := gortsplib.DialPublish(
-			"rtsp://localhost:8554/test1",
-			gortsplib.Tracks{track})
+		conn := gortsplib.Client{}
+		err = conn.StartRecording("rtsp://localhost:8554/test1", media.Medias{medi})
 		require.NoError(t, err)
 		defer conn.Close()
 	}()

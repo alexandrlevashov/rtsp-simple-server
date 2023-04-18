@@ -1,87 +1,67 @@
 package core
 
 import (
-	"sync"
+	"github.com/bluenviron/gortsplib/v3"
+	"github.com/bluenviron/gortsplib/v3/pkg/formats"
+	"github.com/bluenviron/gortsplib/v3/pkg/media"
 
-	"github.com/aler9/gortsplib"
+	"github.com/aler9/mediamtx/internal/formatprocessor"
 )
 
-type streamNonRTSPReadersMap struct {
-	mutex sync.RWMutex
-	ma    map[reader]struct{}
-}
-
-func newStreamNonRTSPReadersMap() *streamNonRTSPReadersMap {
-	return &streamNonRTSPReadersMap{
-		ma: make(map[reader]struct{}),
-	}
-}
-
-func (m *streamNonRTSPReadersMap) close() {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.ma = nil
-}
-
-func (m *streamNonRTSPReadersMap) add(r reader) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.ma[r] = struct{}{}
-}
-
-func (m *streamNonRTSPReadersMap) remove(r reader) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	delete(m.ma, r)
-}
-
-func (m *streamNonRTSPReadersMap) forwardFrame(trackID int, streamType gortsplib.StreamType, payload []byte) {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	for c := range m.ma {
-		c.onReaderFrame(trackID, streamType, payload)
-	}
-}
-
 type stream struct {
-	nonRTSPReaders *streamNonRTSPReadersMap
-	rtspStream     *gortsplib.ServerStream
+	bytesReceived *uint64
+	rtspStream    *gortsplib.ServerStream
+	smedias       map[*media.Media]*streamMedia
 }
 
-func newStream(tracks gortsplib.Tracks) *stream {
+func newStream(
+	udpMaxPayloadSize int,
+	medias media.Medias,
+	generateRTPPackets bool,
+	bytesReceived *uint64,
+) (*stream, error) {
 	s := &stream{
-		nonRTSPReaders: newStreamNonRTSPReadersMap(),
-		rtspStream:     gortsplib.NewServerStream(tracks),
+		bytesReceived: bytesReceived,
+		rtspStream:    gortsplib.NewServerStream(medias),
 	}
-	return s
+
+	s.smedias = make(map[*media.Media]*streamMedia)
+
+	for _, media := range s.rtspStream.Medias() {
+		var err error
+		s.smedias[media], err = newStreamMedia(udpMaxPayloadSize, media, generateRTPPackets)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return s, nil
 }
 
 func (s *stream) close() {
-	s.nonRTSPReaders.close()
 	s.rtspStream.Close()
 }
 
-func (s *stream) tracks() gortsplib.Tracks {
-	return s.rtspStream.Tracks()
+func (s *stream) medias() media.Medias {
+	return s.rtspStream.Medias()
 }
 
-func (s *stream) readerAdd(r reader) {
-	if _, ok := r.(pathRTSPSession); !ok {
-		s.nonRTSPReaders.add(r)
-	}
+func (s *stream) readerAdd(r reader, medi *media.Media, forma formats.Format, cb func(formatprocessor.Unit)) {
+	sm := s.smedias[medi]
+	sf := sm.formats[forma]
+	sf.readerAdd(r, cb)
 }
 
 func (s *stream) readerRemove(r reader) {
-	if _, ok := r.(pathRTSPSession); !ok {
-		s.nonRTSPReaders.remove(r)
+	for _, sm := range s.smedias {
+		for _, sf := range sm.formats {
+			sf.readerRemove(r)
+		}
 	}
 }
 
-func (s *stream) onFrame(trackID int, streamType gortsplib.StreamType, payload []byte) {
-	// forward to RTSP readers
-	s.rtspStream.WriteFrame(trackID, streamType, payload)
-
-	// forward to non-RTSP readers
-	s.nonRTSPReaders.forwardFrame(trackID, streamType, payload)
+func (s *stream) writeData(medi *media.Media, forma formats.Format, data formatprocessor.Unit) error {
+	sm := s.smedias[medi]
+	sf := sm.formats[forma]
+	return sf.writeData(s, medi, data)
 }
